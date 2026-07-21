@@ -12,7 +12,7 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 ## Current Status
 
-**Phases 1 and 2 are complete.** The implementation lives in `index.ts` and exposes:
+**Phases 1 through 3 are complete.** The implementation lives in `index.ts` and exposes:
 
 - `analyzeSource`, for analyzing supplied TypeScript source text without writing it to disk;
 - `analyzeFile`, for loading a file, finding its nearest `tsconfig.json`, and passing it through the same analysis;
@@ -21,9 +21,9 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 The `cli.ts` entry point is available through `npm run analyze -- [options] <file> <function>`. It supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`.
 
-The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes block-contained `if` statements with block-bodied edges. Existing annotations are replaced rather than preserved. A function is rejected as a whole if any parameter cannot be overridden safely.
+The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing annotations are replaced rather than preserved. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Seventeen tests in `index.test.ts` cover Phases 1 and 2. `npm test`, strict TypeScript checking, CLI help execution, and `git diff --check` pass as of the Phase 2 implementation.
+Twenty-three tests in `index.test.ts` cover Phases 1 through 3. `npm test`, strict TypeScript checking, CLI help execution, and `git diff --check` pass as of the Phase 3 implementation.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -109,13 +109,14 @@ The initial implementation only supports functions whose parameters are all non-
 
 Insert probe statements containing direct references to every parameter, for example an array expression under `void`. Each statement must carry a unique marker. Avoid helper calls because calls can participate in control-flow analysis and introduce avoidable side effects into the counterfactual program.
 
-The first version should only instrument branch points where probes can be inserted without restructuring the original code:
+Instrumentation uses the smallest virtual rewrite appropriate to each branch shape:
 
-- the `if` is directly contained in a block;
-- the consequent is a block;
-- the `else`, when present, is a block.
+- insert directly into existing blocks and statement lists;
+- wrap unbraced edges and an `if` in a single-statement parent with virtual blocks;
+- synthesize a probe-only `else` when the source has no false body;
+- order insertions by nesting depth so dangling `else`, nested missing edges, loops, and labels retain their original control-flow structure.
 
-Support for unbraced statements and missing `else` edges comes later, after tests show that wrapping or synthesizing blocks preserves binding, dangling-`else` behavior, labels, and reported locations.
+Before wrapping, inspect the affected single-statement chain for declarations whose scope would change. Report such a branch as unsupported without applying partial edits. Reparse all accepted rewrites and verify that each probe identifier still resolves to the selected parameter symbol; report branches with shadowed probes as unsupported.
 
 ### JavaScript inputs
 
@@ -153,18 +154,21 @@ Acceptance criteria:
 - [x] Report “unsupported” separately from “reachable”; never silently skip a parameter or branch.
 - [x] Add focused tests around source edits, marker lookup, diagnostics, symbol binding, and location mapping.
 
-### Phase 3: Expand `if` coverage — Next
+### Phase 3: Expand `if` coverage — Complete
 
-Add one construct at a time with semantic-preservation tests:
+Completed with semantic-preservation tests:
 
-1. unbraced consequents and alternatives;
-2. absent `else` by creating a probe-only false edge;
-3. `else if` chains with clear edge identities;
-4. branches nested under loops, labels, and other single-statement parents.
+- [x] Unbraced consequents and alternatives.
+- [x] Absent `else` via a probe-only false edge.
+- [x] `else if` chains with clear edge identities.
+- [x] Branches nested under loops, labels, and other single-statement parents.
+- [x] Dangling-`else` preservation under nested virtual wrappers.
+- [x] Shared-position edit ordering for nested wrappers and synthetic edges.
+- [x] Rejection of direct or chained unbraced declarations when wrapping would change scope.
 
 Do not add `switch` or conditional expressions in this phase. `switch` requires a defined policy for fallthrough and merged case flow. Conditional expressions require expression-level instrumentation, which has different contextual-typing risks from statement probes.
 
-### Phase 4: Analyze JavaScript functions
+### Phase 4: Analyze JavaScript functions — Next
 
 - Add JSDoc-based parameter overrides.
 - Validate that probe identifiers in `.js` receive flow-sensitive types under `checkJs`.
@@ -239,10 +243,10 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 17 automated API, compiler-host, formatting, configuration, and CLI integration tests;
+- `index.test.ts`: 23 automated API, compiler-host, branch-rewrite, formatting, configuration, and CLI integration tests;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
-- `tests/unsupported.ts`: rest, defaulted, destructured, explicit-`this`, and unbraced unsupported examples;
+- `tests/unsupported.ts`: rest, defaulted, destructured, explicit-`this`, and declaration-scope unsupported examples;
 - `tests/README.md`: commands for human-readable, JSON, custom-type, diagnostic, and unsupported runs.
 
 ## Risks and Guardrails

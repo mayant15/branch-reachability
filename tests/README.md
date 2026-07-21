@@ -73,10 +73,10 @@ npm run analyze -- tests/unsupported.ts destructuredParameter
 npm run analyze -- tests/unsupported.ts explicitThis
 ```
 
-Unbraced branch bodies are reported as unsupported while the function itself remains analyzable:
+Wrapping an unbraced declaration in a probe block would change the declaration's scope, so that branch is also rejected instead of being rewritten unsafely:
 
 ```sh
-npm run analyze -- tests/unsupported.ts unbracedBranch
+npm run analyze -- tests/unsupported.ts declarationScope
 ```
 
-The reachability fixtures use block-bodied `if` statements and simple identifier parameters. `unsupported.ts` intentionally violates those constraints to demonstrate the analyzer's unsupported-construct reporting.
+`unsupported.ts` intentionally uses constructs that cannot be instrumented without changing the analysis contract or source semantics.

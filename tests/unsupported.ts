@@ -22,6 +22,7 @@ export function explicitThis(this: {ready: boolean}, value: string) {
   }
 }
 
-export function unbracedBranch(value: string) {
-  if (typeof value === "string") return value
+export function declarationScope(value: string) {
+  if (value) function helper() {}
+  helper()
 }

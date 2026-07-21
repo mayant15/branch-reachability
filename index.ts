@@ -388,61 +388,156 @@ function planBranches(
   const branches: PlannedBranch[] = []
   let nextProbeId = 0
 
-  function makeProbe(position: number): ProbeMetadata {
+  function makeProbe(): {metadata: ProbeMetadata; statement: string} {
     const probe = {
       id: `${probeMarkerPrefix}${nextProbeId++}`,
       parameterNames,
     }
     const elements = [JSON.stringify(probe.id), ...parameterNames].join(", ")
+    return {metadata: probe, statement: `void [${elements}];`}
+  }
+
+  function insert(position: number, text: string, order: number): void {
     edits.push({
       start: position,
       end: position,
-      text: `\nvoid [${elements}];\n`,
-      order: edits.length,
+      text,
+      order,
     })
-    return probe
   }
 
-  function visit(node: ts.Node): void {
+  function startOrder(depth: number, role: number): number {
+    return 200_000 + depth * 10 + role
+  }
+
+  function endOrder(depth: number, role: "edge" | "missing-else" | "statement"): number {
+    const roleOrder = role === "edge" ? 0 : role === "missing-else" ? 1 : 2
+    return 100_000 - depth * 10 + roleOrder
+  }
+
+  function isStatementListContainer(node: ts.Node): boolean {
+    return ts.isBlock(node)
+      || ts.isSourceFile(node)
+      || ts.isModuleBlock(node)
+      || ts.isCaseOrDefaultClause(node)
+  }
+
+  function wrappingChangesDeclarationScope(statement: ts.Statement): boolean {
+    let found = false
+
+    function visit(node: ts.Node): void {
+      if (ts.isDeclarationStatement(node)) {
+        found = true
+        return
+      }
+      if (
+        node !== statement
+        && (ts.isBlock(node) || ts.isCaseBlock(node) || ts.isFunctionLike(node))
+      ) {
+        return
+      }
+      ts.forEachChild(node, visit)
+    }
+
+    visit(statement)
+    return found
+  }
+
+  function cannotWrapSafely(node: ts.IfStatement): boolean {
+    return !isStatementListContainer(node.parent) && wrappingChangesDeclarationScope(node)
+      || !ts.isBlock(node.thenStatement) && wrappingChangesDeclarationScope(node.thenStatement)
+      || node.elseStatement !== undefined
+        && !ts.isBlock(node.elseStatement)
+        && wrappingChangesDeclarationScope(node.elseStatement)
+  }
+
+  function planBaseline(node: ts.IfStatement, depth: number): ProbeMetadata {
+    const probe = makeProbe()
+    if (isStatementListContainer(node.parent)) {
+      insert(
+        node.getStart(sourceFile),
+        `\n${probe.statement}\n`,
+        startOrder(depth, 0),
+      )
+    } else {
+      insert(
+        node.getStart(sourceFile),
+        `{\n${probe.statement}\n`,
+        startOrder(depth, 0),
+      )
+      insert(node.end, "\n}", endOrder(depth, "statement"))
+    }
+    return probe.metadata
+  }
+
+  function planExistingEdge(
+    statement: ts.Statement,
+    depth: number,
+    role: number,
+  ): ProbeMetadata {
+    const probe = makeProbe()
+    if (ts.isBlock(statement)) {
+      insert(
+        statement.getStart(sourceFile) + 1,
+        `\n${probe.statement}\n`,
+        startOrder(depth, role),
+      )
+    } else {
+      insert(
+        statement.getStart(sourceFile),
+        `{\n${probe.statement}\n`,
+        startOrder(depth, role),
+      )
+      insert(statement.end, "\n}", endOrder(depth, "edge"))
+    }
+    return probe.metadata
+  }
+
+  function planMissingElse(node: ts.IfStatement, depth: number): ProbeMetadata {
+    const probe = makeProbe()
+    insert(
+      node.end,
+      ` else {\n${probe.statement}\n}`,
+      endOrder(depth, "missing-else"),
+    )
+    return probe.metadata
+  }
+
+  function visit(node: ts.Node, depth: number): void {
     if (node !== target && ts.isFunctionLike(node)) {
       return
     }
 
     if (ts.isIfStatement(node)) {
-      const supported = ts.isBlock(node.parent)
-        && ts.isBlock(node.thenStatement)
-        && (node.elseStatement === undefined || ts.isBlock(node.elseStatement))
-
-      if (!supported) {
+      if (cannotWrapSafely(node)) {
         unsupported.push({
           ...locationOf(sourceFile, node),
-          reason: "Phase 1 only supports block-contained if statements with block-bodied edges",
+          reason: "Instrumenting this unbraced branch would change declaration scope",
         })
       } else {
         const position = locationOf(sourceFile, node)
         const planned: PlannedBranch = {
           ...position,
           condition: node.expression.getText(sourceFile),
-          baseline: makeProbe(node.getStart(sourceFile)),
+          baseline: planBaseline(node, depth),
           edges: [{
             edge: "true",
-            probe: makeProbe(node.thenStatement.getStart(sourceFile) + 1),
-          }],
-        }
-        if (node.elseStatement) {
-          planned.edges.push({
+            probe: planExistingEdge(node.thenStatement, depth, 1),
+          }, {
             edge: "false",
-            probe: makeProbe(node.elseStatement.getStart(sourceFile) + 1),
-          })
+            probe: node.elseStatement
+              ? planExistingEdge(node.elseStatement, depth, 2)
+              : planMissingElse(node, depth),
+          }],
         }
         branches.push(planned)
       }
     }
 
-    ts.forEachChild(node, visit)
+    ts.forEachChild(node, child => visit(child, depth + 1))
   }
 
-  visit(target.body!)
+  visit(target.body!, 0)
   return branches
 }
 

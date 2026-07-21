@@ -216,16 +216,138 @@ function target(value) {
   assert.equal(result.branches[0].edges[0].classification, "reachable")
 })
 
-test("reports unsupported branch shapes instead of partially instrumenting them", () => {
+test("analyzes unbraced branches and synthesizes a missing false edge", () => {
   const result = analyze(`
 function target(value) {
   if (typeof value === "string") console.log(value)
 }
 `)
 
+  assert.equal(result.branches.length, 1)
+  assert.deepEqual(
+    result.branches[0].edges.map(edge => [edge.edge, edge.classification]),
+    [["true", "reachable"], ["false", "newly-unreachable"]],
+  )
+  assert.equal(result.unsupported.length, 0)
+})
+
+test("preserves dangling else behavior while wrapping unbraced edges", () => {
+  const result = analyze(`
+function target(value, other) {
+  if (typeof value === "string")
+    if (typeof other === "number") return "number"
+    else return "not number"
+  else return "not string"
+}
+`)
+
+  assert.equal(result.branches.length, 2)
+  const outer = result.branches.find(branch => branch.condition === 'typeof value === "string"')!
+  const inner = result.branches.find(branch => branch.condition === 'typeof other === "number"')!
+  assert.deepEqual(
+    outer.edges.map(edge => [edge.edge, edge.classification]),
+    [["true", "reachable"], ["false", "newly-unreachable"]],
+  )
+  assert.deepEqual(
+    inner.edges.map(edge => [edge.edge, edge.classification]),
+    [["true", "newly-unreachable"], ["false", "reachable"]],
+  )
+})
+
+test("orders nested unbraced missing-else rewrites at a shared endpoint", () => {
+  const result = analyze(`
+function target(value, other) {
+  if (typeof value === "string")
+    if (typeof other === "number") return "number"
+}
+`)
+
+  assert.equal(result.branches.length, 2)
+  const outer = result.branches.find(branch => branch.condition === 'typeof value === "string"')!
+  const inner = result.branches.find(branch => branch.condition === 'typeof other === "number"')!
+  assert.deepEqual(outer.edges.map(edge => edge.classification), [
+    "reachable",
+    "newly-unreachable",
+  ])
+  assert.deepEqual(inner.edges.map(edge => edge.classification), [
+    "newly-unreachable",
+    "reachable",
+  ])
+})
+
+test("reports clear edges for else-if chains", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "number") {
+    return "number"
+  } else if (typeof value === "boolean") {
+    return "boolean"
+  } else {
+    return "string"
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 2)
+  const first = result.branches[0]
+  const second = result.branches[1]
+  assert.equal(first.condition, 'typeof value === "number"')
+  assert.deepEqual(first.edges.map(edge => edge.classification), [
+    "newly-unreachable",
+    "reachable",
+  ])
+  assert.equal(second.condition, 'typeof value === "boolean"')
+  assert.deepEqual(second.edges.map(edge => edge.classification), [
+    "newly-unreachable",
+    "reachable",
+  ])
+})
+
+test("analyzes an if used as a labeled loop body", () => {
+  const result = analyze(`
+function target(value) {
+  outer: for (let index = 0; index < 1; index++)
+    if (typeof value === "number")
+      continue outer
+    else
+      break outer
+}
+`)
+
+  assert.equal(result.branches.length, 1)
+  assert.deepEqual(
+    result.branches[0].edges.map(edge => edge.classification),
+    ["newly-unreachable", "reachable"],
+  )
+  assert.equal(result.diagnostics.length, 0)
+})
+
+test("rejects an unbraced declaration whose scope would change", () => {
+  const result = analyze(`
+function target(value) {
+  if (value) function helper() {}
+  helper()
+}
+`)
+
   assert.equal(result.branches.length, 0)
   assert.equal(result.unsupported.length, 1)
-  assert.match(result.unsupported[0].reason, /block-bodied/)
+  assert.match(result.unsupported[0].reason, /declaration scope/)
+  assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 2304), false)
+})
+
+test("rejects declarations reached through an unbraced statement chain", () => {
+  const result = analyze(`
+function target(value) {
+  if (value) while (value) function helper() {}
+  helper()
+}
+`)
+
+  assert.equal(result.branches.length, 0)
+  assert.equal(result.unsupported.length, 1)
+  assert.match(result.unsupported[0].reason, /declaration scope/)
+  assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 2304), false)
 })
 
 test("formats a deterministic human-readable report", () => {
