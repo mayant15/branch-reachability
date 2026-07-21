@@ -12,18 +12,20 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 ## Current Status
 
-**Phases 1 through 4 are complete.** The implementation lives in `index.ts` and exposes:
+**Phases 1 through 5 are complete, so the initial prototype definition of done is satisfied.** The implementation lives in `index.ts` and exposes:
 
 - `analyzeSource`, for analyzing supplied TypeScript source text without writing it to disk;
 - `analyzeFile`, for loading a file, finding its nearest `tsconfig.json`, and passing it through the same analysis;
 - `formatAnalysisResult`, for deterministic human-readable output;
 - structured branch, edge, parameter, diagnostic, and unsupported-construct results.
 
-The `cli.ts` entry point is available through `npm run analyze -- [options] <file> <function>`. It supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`.
+`discovery.ts` exposes `analyzePackageExport` and `formatPackageAnalysisResult` for CommonJS package-export resolution and bounded direct-call traversal.
+
+The `cli.ts` entry point is available through `npm run analyze`. File mode supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`. Package mode accepts `--package`, `--export`, `--max-depth`, and `--max-functions`.
 
 The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Thirty-one tests in `index.test.ts` cover Phases 1 through 4. `npm test`, strict TypeScript checking, CLI help execution, and `git diff --check` pass as of the Phase 4 implementation.
+Thirty-seven tests in `index.test.ts` cover Phases 1 through 5. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass as of the Phase 5 implementation.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -91,9 +93,10 @@ Keep the first implementation small, but separate these responsibilities so the 
    - Start with deterministic JSON-friendly records and a concise terminal rendering.
    - Include target, branch location, edge, baseline/edge types per parameter, classification, diagnostics, and unsupported constructs.
 
-6. **Function discovery** (later phase)
+6. **Function discovery**
    - Resolve package exports, CommonJS forwarding assignments, local calls, and recursively discovered declarations.
    - Feed each discovered function independently into the same analyzer.
+   - Record unresolved calls and traversal truncation instead of guessing.
 
 ## Source Instrumentation
 
@@ -182,9 +185,9 @@ Integration result with `T = string`:
 - no parameter-based unreachable edge is found because these conditions inspect `documents`, string contents, or local positions rather than narrow a parameter's possible type;
 - `loadDocuments` reports the expected counterfactual TS2322 at `options = options || {}` because `{}` is not assignable to the injected `string` type.
 
-### Phase 5: Discover the `js-yaml` call chain — Next
+### Phase 5: Discover the `js-yaml` call chain — Complete
 
-Treat this as source discovery, not interprocedural type propagation.
+Implemented as source discovery, not interprocedural type propagation.
 
 Start from an explicit runtime target such as:
 
@@ -194,12 +197,17 @@ module condition: require
 export: load
 ```
 
-Support only the forms needed by the target first:
+Supported forms:
 
-- `const`/`var x = require("./relative")`;
-- `module.exports.name = x.property`;
-- `module.exports.name = localIdentifier`;
-- direct calls to local function declarations.
+- [x] `const`/`var x = require("./relative")`;
+- [x] `module.exports.name = x.property`;
+- [x] `module.exports.name = localIdentifier` and `exports.name = localIdentifier`;
+- [x] effective final assignment and final merged function-declaration semantics;
+- [x] direct calls to local function declarations using checker-resolved symbols;
+- [x] canonical file/declaration-position identities and cycle protection;
+- [x] configurable depth and function-count guards;
+- [x] explicit unresolved-call and truncated-function records;
+- [x] human-readable and JSON package-mode CLI output.
 
 The first integration path should resolve:
 
@@ -214,7 +222,14 @@ Use canonical file plus declaration position as function identity. Add visited-s
 
 Do not rely on the imported `load` symbol in this repository's `index.ts` to find the runtime implementation: TypeScript can resolve that import to `@types/js-yaml`, while the package selects different runtime files for ESM import and CommonJS require.
 
-### Phase 6: Evaluate interprocedural value
+`js-yaml` integration results:
+
+- depth 1 resolves and analyzes exactly `load → loadDocuments`, with `throwError` and `readDocument` explicitly depth-truncated;
+- the default depth-3 traversal analyzes 13 functions, records 50 unresolved or non-identifier calls, and records 10 depth-truncated functions;
+- across those 13 functions, `composeNode` contains one newly unreachable edge at line 1430: the true edge of `CONTEXT_FLOW_IN === nodeContext || CONTEXT_FLOW_OUT === nodeContext` narrows configured `nodeContext: string` to `never`;
+- package resolution uses Node's actual `require` resolver. The supported CommonJS assignment forms are inspected statically; executing package code remains an available future fallback for more dynamic export patterns.
+
+### Phase 6: Evaluate interprocedural value — Next
 
 After collecting real `js-yaml` results, decide whether call traversal alone is useful. Independently analyzing callees does not propagate caller argument types, aliases, or object-property provenance.
 
@@ -248,7 +263,7 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 31 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, formatting, configuration, CLI, and `js-yaml` integration tests;
+- `index.test.ts`: 37 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, formatting, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
 - `tests/javascript.js`: JavaScript analysis with existing JSDoc and CommonJS export syntax;

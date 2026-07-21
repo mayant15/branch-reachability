@@ -5,6 +5,7 @@ import path from "node:path"
 import {spawnSync} from "node:child_process"
 import test from "node:test"
 import ts from "typescript"
+import {analyzePackageExport, formatPackageAnalysisResult} from "./discovery.ts"
 import {analyzeFile, analyzeSource, formatAnalysisResult} from "./index.ts"
 
 function analyze(sourceText: string, typeText = "string") {
@@ -493,6 +494,152 @@ test("analyzes js-yaml load and loadDocuments directly", () => {
     ["string", "string"],
   )
   assert.equal(loadDocuments.diagnostics.some(diagnostic => diagnostic.code === 2322), true)
+})
+
+test("discovers the js-yaml CommonJS load chain", () => {
+  const result = analyzePackageExport({
+    packageName: "js-yaml",
+    exportName: "load",
+    maxDepth: 1,
+    maxFunctions: 10,
+  })
+
+  assert.match(result.entryFile, /node_modules\/js-yaml\/index\.js$/)
+  assert.deepEqual(
+    result.exportPath.map(step => [path.basename(step.fileName), step.expression]),
+    [["index.js", "loader.load"], ["loader.js", "load"]],
+  )
+  assert.deepEqual(result.functions.map(discovered => discovered.functionName), [
+    "load",
+    "loadDocuments",
+  ])
+  assert.deepEqual(result.functions.map(discovered => discovered.depth), [0, 1])
+  assert.equal(result.truncated.some(item => item.functionName === "readDocument"), true)
+  assert.match(formatPackageAnalysisResult(result), /js-yaml\.load \(require\)/)
+})
+
+test("CLI emits package discovery JSON", () => {
+  const execution = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "cli.ts",
+      "--package", "js-yaml",
+      "--export", "load",
+      "--max-depth", "1",
+      "--json",
+    ],
+    {cwd: path.resolve("."), encoding: "utf8"},
+  )
+
+  assert.equal(execution.status, 0, execution.stderr)
+  const result = JSON.parse(execution.stdout)
+  assert.deepEqual(result.functions.map((item: {functionName: string}) => item.functionName), [
+    "load",
+    "loadDocuments",
+  ])
+})
+
+test("CommonJS discovery uses the final export assignment", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-package-"))
+  try {
+    const entryFile = path.join(directory, "index.js")
+    writeFileSync(entryFile, `
+function oldLoad(value) {
+  if (typeof value === "string") return "old"
+}
+function currentLoad(value) {
+  if (typeof value === "number") return "current"
+}
+module.exports.load = oldLoad
+module.exports.load = currentLoad
+`)
+
+    const result = analyzePackageExport({
+      packageName: entryFile,
+      exportName: "load",
+      maxDepth: 0,
+    })
+
+    assert.equal(result.exportPath[0].expression, "currentLoad")
+    assert.equal(result.functions[0].functionName, "currentLoad")
+    assert.equal(result.functions[0].analysis.branches[0].edges[0].classification, "newly-unreachable")
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("CommonJS discovery uses the final merged function declaration", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-package-"))
+  try {
+    const entryFile = path.join(directory, "index.js")
+    writeFileSync(entryFile, `
+function load(value) {
+  if (typeof value === "string") return "old"
+}
+function load(value) {
+  if (typeof value === "number") return "current"
+}
+module.exports.load = load
+`)
+
+    const result = analyzePackageExport({
+      packageName: entryFile,
+      exportName: "load",
+      maxDepth: 0,
+    })
+
+    assert.equal(result.functions[0].line, 5)
+    assert.equal(result.functions[0].analysis.branches[0].condition, 'typeof value === "number"')
+    assert.equal(result.functions[0].analysis.branches[0].edges[0].classification, "newly-unreachable")
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("package traversal guards recursive calls and maximum function count", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-package-"))
+  try {
+    const entryFile = path.join(directory, "index.js")
+    writeFileSync(entryFile, `
+function load(value) {
+  if (typeof value === "string") load(value)
+}
+module.exports.load = load
+`)
+    const recursive = analyzePackageExport({
+      packageName: entryFile,
+      exportName: "load",
+      maxDepth: 10,
+    })
+
+    assert.equal(recursive.functions.length, 1)
+    assert.equal(recursive.truncated.length, 0)
+
+    const limited = analyzePackageExport({
+      packageName: "js-yaml",
+      exportName: "load",
+      maxDepth: 3,
+      maxFunctions: 1,
+    })
+    assert.deepEqual(limited.functions.map(item => item.functionName), ["load"])
+    assert.equal(limited.truncated.some(item =>
+      item.functionName === "loadDocuments" && item.reason === "maximum function count reached"
+    ), true)
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("CLI rejects package-only options in file mode", () => {
+  const execution = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "cli.ts", "--max-depth", "1", "index.ts", "analyzeFile"],
+    {cwd: path.resolve("."), encoding: "utf8"},
+  )
+
+  assert.equal(execution.status, 1)
+  assert.match(execution.stderr, /require --package/)
 })
 
 test("formats a deterministic human-readable report", () => {

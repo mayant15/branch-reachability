@@ -70,6 +70,26 @@ The analyzer keeps the file in JavaScript mode and overrides the existing `@para
 npm run analyze -- tests/javascript.js classifyJavaScript
 ```
 
+## Package export and call-chain discovery
+
+Resolve `js-yaml` through Node's CommonJS `require` condition, follow its forwarded `load` export, and recursively analyze direct local callees. The default traversal depth is 3.
+
+```sh
+npm run analyze -- --package js-yaml --export load
+```
+
+Limit the result to the exact `load` to `loadDocuments` chain:
+
+```sh
+npm run analyze -- --package js-yaml --export load --max-depth 1
+```
+
+Structured package results include export-resolution steps, complete per-function analyses, unresolved calls, and functions omitted by traversal guards:
+
+```sh
+npm run analyze -- --package js-yaml --export load --max-depth 1 --json
+```
+
 ## Unsupported functions and branches
 
 Phase 1 requires every parameter to be a simple identifier without rest syntax or a default. Each of these commands rejects the entire selected function and explains why:

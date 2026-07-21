@@ -5,6 +5,7 @@ export interface AnalyzeSourceOptions {
   fileName: string
   sourceText: string
   functionName: string
+  functionPosition?: number
   typeText?: string
   compilerOptions?: ts.CompilerOptions
 }
@@ -109,6 +110,7 @@ export function analyzeFile(options: AnalyzeFileOptions): AnalysisResult {
     fileName,
     sourceText,
     functionName: options.functionName,
+    functionPosition: options.functionPosition,
     typeText: options.typeText,
     compilerOptions: {
       ...configured.options,
@@ -222,7 +224,7 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     true,
     scriptKind,
   )
-  const target = findFunction(originalSource, options.functionName)
+  const target = findFunction(originalSource, options.functionName, options.functionPosition)
   const unsupported: UnsupportedConstruct[] = []
   const edits: TextEdit[] = []
   const parameterNames = planParameterEdits(
@@ -272,7 +274,11 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
   }
 
   const checker = program.getTypeChecker()
-  const instrumentedTarget = findFunction(sourceFile, options.functionName)
+  const instrumentedTarget = findFunction(
+    sourceFile,
+    options.functionName,
+    options.functionPosition,
+  )
   const parameterSymbols = new Map<string, ts.Symbol>()
   for (const parameter of instrumentedTarget.parameters) {
     if (ts.isIdentifier(parameter.name)) {
@@ -319,11 +325,20 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
   }
 }
 
-function findFunction(sourceFile: ts.SourceFile, functionName: string): ts.FunctionDeclaration {
+function findFunction(
+  sourceFile: ts.SourceFile,
+  functionName: string,
+  functionPosition?: number,
+): ts.FunctionDeclaration {
   const matches: ts.FunctionDeclaration[] = []
 
   function visit(node: ts.Node): void {
-    if (ts.isFunctionDeclaration(node) && node.name?.text === functionName && node.body) {
+    if (
+      ts.isFunctionDeclaration(node)
+      && node.name?.text === functionName
+      && node.body
+      && (functionPosition === undefined || node.getStart(sourceFile) === functionPosition)
+    ) {
       matches.push(node)
     }
     ts.forEachChild(node, visit)
