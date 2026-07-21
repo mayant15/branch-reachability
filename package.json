@@ -3,10 +3,16 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.ts",
-  "scripts": {},
+  "scripts": {
+    "test": "echo \"no tests.\""
+  },
   "license": "ISC",
   "type": "module",
   "devDependencies": {
-    "@typescript/native-preview": "^7.0.0-dev.20260707.2"
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
+    "js-yaml": "4.1.0"
+  },
+  "dependencies": {
+    "typescript": "6.0.3"
   }
 }
