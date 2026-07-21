@@ -1,0 +1,12 @@
+{
+  "name": "branch-reachability",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.ts",
+  "scripts": {},
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@typescript/native-preview": "^7.0.0-dev.20260707.2"
+  }
+}
