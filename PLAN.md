@@ -12,7 +12,7 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 ## Current Status
 
-**Phases 1 through 3 are complete.** The implementation lives in `index.ts` and exposes:
+**Phases 1 through 4 are complete.** The implementation lives in `index.ts` and exposes:
 
 - `analyzeSource`, for analyzing supplied TypeScript source text without writing it to disk;
 - `analyzeFile`, for loading a file, finding its nearest `tsconfig.json`, and passing it through the same analysis;
@@ -21,9 +21,9 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 The `cli.ts` entry point is available through `npm run analyze -- [options] <file> <function>`. It supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`.
 
-The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing annotations are replaced rather than preserved. A function is rejected as a whole if any parameter cannot be overridden safely.
+The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Twenty-three tests in `index.test.ts` cover Phases 1 through 3. `npm test`, strict TypeScript checking, CLI help execution, and `git diff --check` pass as of the Phase 3 implementation.
+Thirty-one tests in `index.test.ts` cover Phases 1 through 4. `npm test`, strict TypeScript checking, CLI help execution, and `git diff --check` pass as of the Phase 4 implementation.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -120,9 +120,9 @@ Before wrapping, inspect the affected single-statement chain for declarations wh
 
 ### JavaScript inputs
 
-Keep JavaScript sources as `.js`; use `allowJs`, `checkJs`, and `noEmit`. Do not print TypeScript annotations into JavaScript.
+JavaScript sources remain in JavaScript mode with `allowJs`, `checkJs`, and `noEmit`; the analyzer never prints TypeScript annotations into JavaScript. Standalone JavaScript defaults to non-strict checking to avoid unrelated implicit-`any` noise, while discovered or explicit project settings can enable strictness. JSX defaults to preserved JSX when no project setting overrides it.
 
-Override every parameter of the selected function with `T` through JSDoc edits, including parameters that already have JSDoc types, and prove the exact edit strategy on fixtures before applying it to dependencies. Existing JSDoc, duplicate `@param` tags, and optional/default parameter syntax must have deterministic handling. If any parameter cannot be overridden safely, mark the entire function unsupported rather than analyzing a subset. As with TypeScript, reparse the edited JavaScript and query only nodes from the fresh program.
+Every supported parameter receives an inline `/** @type {T} */` annotation immediately before its identifier. This takes precedence over existing function-level `@param` and inline `@type` annotations without deleting source comments. Optional JSDoc parameters are rejected because their existing optionality would retain `undefined` and violate the exact-`T` invariant. If any parameter cannot be overridden safely, the entire function is unsupported rather than analyzing a subset. As with TypeScript, the edited JavaScript is reparsed and only nodes from the fresh program are queried.
 
 ## Delivery Phases
 
@@ -168,16 +168,21 @@ Completed with semantic-preservation tests:
 
 Do not add `switch` or conditional expressions in this phase. `switch` requires a defined policy for fallthrough and merged case flow. Conditional expressions require expression-level instrumentation, which has different contextual-typing risks from statement probes.
 
-### Phase 4: Analyze JavaScript functions — Next
+### Phase 4: Analyze JavaScript functions — Complete
 
-- Add JSDoc-based parameter overrides.
-- Validate that probe identifiers in `.js` receive flow-sensitive types under `checkJs`.
-- Test files with existing JSDoc and CommonJS syntax.
-- Analyze `node_modules/js-yaml/lib/loader.js` functions directly before adding package-level discovery.
+- [x] Add inline JSDoc-based parameter overrides without changing JavaScript language mode.
+- [x] Validate that probe identifiers in `.js` receive flow-sensitive types under `checkJs`.
+- [x] Test existing JSDoc, optional JSDoc, CommonJS, JSX, CJS, and MJS syntax and settings.
+- [x] Analyze `node_modules/js-yaml/lib/loader.js` functions directly before package-level discovery.
 
-Success means the analyzer can process `load` and `loadDocuments` and return honest results, even if it finds no unreachable parameter edges.
+Integration result with `T = string`:
 
-### Phase 5: Discover the `js-yaml` call chain
+- `load`: 2 `if` conditions, 4 edges, all reachable for both `input` and `options`;
+- `loadDocuments`: 4 `if` conditions, 8 edges, all reachable for both parameters;
+- no parameter-based unreachable edge is found because these conditions inspect `documents`, string contents, or local positions rather than narrow a parameter's possible type;
+- `loadDocuments` reports the expected counterfactual TS2322 at `options = options || {}` because `{}` is not assignable to the injected `string` type.
+
+### Phase 5: Discover the `js-yaml` call chain — Next
 
 Treat this as source discovery, not interprocedural type propagation.
 
@@ -243,9 +248,10 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 23 automated API, compiler-host, branch-rewrite, formatting, configuration, and CLI integration tests;
+- `index.test.ts`: 31 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, formatting, configuration, CLI, and `js-yaml` integration tests;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
+- `tests/javascript.js`: JavaScript analysis with existing JSDoc and CommonJS export syntax;
 - `tests/unsupported.ts`: rest, defaulted, destructured, explicit-`this`, and declaration-scope unsupported examples;
 - `tests/README.md`: commands for human-readable, JSON, custom-type, diagnostic, and unsupported runs.
 

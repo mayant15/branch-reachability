@@ -203,21 +203,24 @@ function loadCompilerOptions(
 export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
   const fileName = path.resolve(options.fileName)
   const typeText = options.typeText ?? "string"
+  const scriptKind = scriptKindForFile(fileName)
+  const isJavaScript = scriptKind === ts.ScriptKind.JS || scriptKind === ts.ScriptKind.JSX
   const compilerOptions: ts.CompilerOptions = {
-    strict: true,
+    strict: !isJavaScript,
     noEmit: true,
     target: ts.ScriptTarget.ESNext,
     module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
     skipLibCheck: true,
+    ...(scriptKind === ts.ScriptKind.JSX ? {jsx: ts.JsxEmit.Preserve} : {}),
     ...options.compilerOptions,
+    ...(isJavaScript ? {allowJs: true, checkJs: true, noEmit: true} : {}),
   }
   const originalSource = ts.createSourceFile(
     fileName,
     options.sourceText,
     ts.ScriptTarget.Latest,
     true,
-    ts.ScriptKind.TS,
+    scriptKind,
   )
   const target = findFunction(originalSource, options.functionName)
   const unsupported: UnsupportedConstruct[] = []
@@ -226,6 +229,7 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     target,
     originalSource,
     typeText,
+    isJavaScript,
     unsupported,
     edits,
   )
@@ -339,22 +343,31 @@ function planParameterEdits(
   target: ts.FunctionDeclaration,
   sourceFile: ts.SourceFile,
   typeText: string,
+  isJavaScript: boolean,
   unsupported: UnsupportedConstruct[],
   edits?: TextEdit[],
 ): string[] | undefined {
   const names: string[] = []
 
   for (const parameter of target.parameters) {
+    const hasOptionalJSDoc = isJavaScript && ts.getJSDocParameterTags(parameter).some(tag =>
+      tag.isBracketed
+      || tag.typeExpression !== undefined
+        && ts.isJSDocOptionalType(tag.typeExpression.type)
+    )
     if (
       !ts.isIdentifier(parameter.name)
       || parameter.name.text === "this"
       || parameter.dotDotDotToken !== undefined
       || parameter.initializer !== undefined
       || parameter.modifiers !== undefined
+      || hasOptionalJSDoc
     ) {
       unsupported.push({
         ...locationOf(sourceFile, parameter),
-        reason: "All parameters must be simple, non-rest identifiers without default initializers",
+        reason: hasOptionalJSDoc
+          ? "Optional JSDoc parameters cannot be overridden with exactly T"
+          : "All parameters must be simple, non-rest identifiers without default initializers",
       })
       return undefined
     }
@@ -364,13 +377,22 @@ function planParameterEdits(
   if (edits) {
     for (const parameter of target.parameters) {
       const name = parameter.name as ts.Identifier
-      const existingSuffix = parameter.type ?? parameter.questionToken
-      edits.push({
-        start: name.end,
-        end: existingSuffix?.end ?? name.end,
-        text: `: ${typeText}`,
-        order: edits.length,
-      })
+      if (isJavaScript) {
+        edits.push({
+          start: name.getStart(sourceFile),
+          end: name.getStart(sourceFile),
+          text: `/** @type {${typeText}} */ `,
+          order: edits.length,
+        })
+      } else {
+        const existingSuffix = parameter.type ?? parameter.questionToken
+        edits.push({
+          start: name.end,
+          end: existingSuffix?.end ?? name.end,
+          text: `: ${typeText}`,
+          order: edits.length,
+        })
+      }
     }
   }
 
@@ -559,18 +581,34 @@ function createVirtualProgram(
 ): ts.Program {
   const defaultHost = ts.createCompilerHost(compilerOptions, true)
   const isVirtualFile = (candidate: string) => path.resolve(candidate) === fileName
+  const scriptKind = scriptKindForFile(fileName)
   const host: ts.CompilerHost = {
     ...defaultHost,
     fileExists: candidate => isVirtualFile(candidate) || defaultHost.fileExists(candidate),
     readFile: candidate => isVirtualFile(candidate) ? sourceText : defaultHost.readFile(candidate),
     getSourceFile: (candidate, languageVersion, onError, shouldCreateNewSourceFile) => {
       if (isVirtualFile(candidate)) {
-        return ts.createSourceFile(candidate, sourceText, languageVersion, true, ts.ScriptKind.TS)
+        return ts.createSourceFile(candidate, sourceText, languageVersion, true, scriptKind)
       }
       return defaultHost.getSourceFile(candidate, languageVersion, onError, shouldCreateNewSourceFile)
     },
   }
   return ts.createProgram([fileName], compilerOptions, host)
+}
+
+function scriptKindForFile(fileName: string): ts.ScriptKind {
+  switch (path.extname(fileName).toLowerCase()) {
+    case ".js":
+    case ".mjs":
+    case ".cjs":
+      return ts.ScriptKind.JS
+    case ".jsx":
+      return ts.ScriptKind.JSX
+    case ".tsx":
+      return ts.ScriptKind.TSX
+    default:
+      return ts.ScriptKind.TS
+  }
 }
 
 function readProbeTypes(

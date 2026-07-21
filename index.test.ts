@@ -4,11 +4,21 @@ import {tmpdir} from "node:os"
 import path from "node:path"
 import {spawnSync} from "node:child_process"
 import test from "node:test"
+import ts from "typescript"
 import {analyzeFile, analyzeSource, formatAnalysisResult} from "./index.ts"
 
 function analyze(sourceText: string, typeText = "string") {
   return analyzeSource({
     fileName: "/virtual/fixture.ts",
+    sourceText,
+    functionName: "target",
+    typeText,
+  })
+}
+
+function analyzeJavaScript(sourceText: string, typeText = "string") {
+  return analyzeSource({
+    fileName: "/virtual/fixture.js",
     sourceText,
     functionName: "target",
     typeText,
@@ -348,6 +358,141 @@ function target(value) {
   assert.equal(result.unsupported.length, 1)
   assert.match(result.unsupported[0].reason, /declaration scope/)
   assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 2304), false)
+})
+
+test("analyzes JavaScript with inline JSDoc parameter overrides", () => {
+  const result = analyzeJavaScript(`
+function target(value) {
+  if (typeof value === "number") {
+    return "number"
+  } else {
+    return "string"
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 1)
+  assert.deepEqual(
+    result.branches[0].edges.map(edge => [edge.edge, edge.classification]),
+    [["true", "newly-unreachable"], ["false", "reachable"]],
+  )
+  assert.equal(result.branches[0].edges[0].parameters[0].baselineType, "string")
+})
+
+test("JavaScript inline overrides replace existing JSDoc parameter types", () => {
+  const result = analyzeJavaScript(`
+/** @param {number} value */
+function target(/** @type {boolean} */ value) {
+  if (typeof value === "number") {
+    return "number"
+  } else {
+    return "string"
+  }
+}
+`)
+
+  assert.equal(result.branches[0].edges[0].parameters[0].baselineType, "string")
+  assert.equal(result.branches[0].edges[0].parameters[0].edgeType, "never")
+  assert.equal(result.branches[0].edges[0].classification, "newly-unreachable")
+})
+
+test("rejects optional JSDoc parameters instead of retaining undefined", () => {
+  for (const annotation of [
+    "/** @param {number} [value] */",
+    "/** @param {number=} value */",
+  ]) {
+    const result = analyzeSource({
+      fileName: "/virtual/optional.js",
+      sourceText: `${annotation}
+function target(value) {
+  if (value === undefined) return "missing"
+  return value
+}`,
+      functionName: "target",
+      compilerOptions: {strict: true},
+    })
+
+    assert.equal(result.branches.length, 0)
+    assert.equal(result.unsupported.length, 1)
+    assert.match(result.unsupported[0].reason, /Optional JSDoc/)
+  }
+})
+
+test("analyzes JavaScript CommonJS source without changing its language mode", () => {
+  const result = analyzeJavaScript(`
+function target(value) {
+  if (typeof value === "string") {
+    return value
+  }
+}
+module.exports.target = target
+`)
+
+  assert.equal(result.branches.length, 1)
+  assert.equal(result.branches[0].edges[1].classification, "newly-unreachable")
+  assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 8010), false)
+})
+
+test("uses a JSX default for standalone JSX source", () => {
+  const result = analyzeSource({
+    fileName: "/virtual/fixture.jsx",
+    sourceText: `function target(value) {
+  if (typeof value === "string") return <div>{value}</div>
+  return null
+}`,
+    functionName: "target",
+  })
+
+  assert.equal(result.branches.length, 1)
+  assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 17004), false)
+})
+
+test("accepts CommonJS module settings for cjs source", () => {
+  const result = analyzeSource({
+    fileName: "/virtual/fixture.cjs",
+    sourceText: `function target(value) {
+  if (typeof value === "string") return value
+}
+module.exports = target`,
+    functionName: "target",
+    compilerOptions: {module: ts.ModuleKind.CommonJS},
+  })
+
+  assert.equal(result.branches.length, 1)
+  assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 5110), false)
+})
+
+test("analyzes mjs source in JavaScript mode", () => {
+  const result = analyzeSource({
+    fileName: "/virtual/fixture.mjs",
+    sourceText: `export function target(value) {
+  if (typeof value === "number") return value
+}`,
+    functionName: "target",
+  })
+
+  assert.equal(result.branches.length, 1)
+  assert.equal(result.branches[0].edges[0].classification, "newly-unreachable")
+})
+
+test("analyzes js-yaml load and loadDocuments directly", () => {
+  const fileName = path.resolve("node_modules/js-yaml/lib/loader.js")
+  const load = analyzeFile({fileName, functionName: "load", tsconfig: false})
+  const loadDocuments = analyzeFile({fileName, functionName: "loadDocuments", tsconfig: false})
+
+  assert.equal(load.branches.length, 2)
+  assert.equal(load.branches.every(branch =>
+    branch.edges.every(edge => edge.classification === "reachable")
+  ), true)
+  assert.equal(loadDocuments.branches.length, 4)
+  assert.equal(loadDocuments.branches.every(branch =>
+    branch.edges.every(edge => edge.classification === "reachable")
+  ), true)
+  assert.deepEqual(
+    loadDocuments.branches[0].edges[0].parameters.map(parameter => parameter.baselineType),
+    ["string", "string"],
+  )
+  assert.equal(loadDocuments.diagnostics.some(diagnostic => diagnostic.code === 2322), true)
 })
 
 test("formats a deterministic human-readable report", () => {

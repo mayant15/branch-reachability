@@ -62,6 +62,14 @@ An invalid configured type also produces a diagnostic marked as originating in g
 npm run analyze -- --type 'MissingType' tests/basic.ts classify
 ```
 
+## JavaScript with existing JSDoc
+
+The analyzer keeps the file in JavaScript mode and overrides the existing `@param {number}` type with inline `@type {string}` JSDoc in its virtual source.
+
+```sh
+npm run analyze -- tests/javascript.js classifyJavaScript
+```
+
 ## Unsupported functions and branches
 
 Phase 1 requires every parameter to be a simple identifier without rest syntax or a default. Each of these commands rejects the entire selected function and explains why:
