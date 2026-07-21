@@ -9,7 +9,9 @@ export interface AnalyzeSourceOptions {
   compilerOptions?: ts.CompilerOptions
 }
 
-export interface AnalyzeFileOptions extends Omit<AnalyzeSourceOptions, "sourceText"> {}
+export interface AnalyzeFileOptions extends Omit<AnalyzeSourceOptions, "sourceText"> {
+  tsconfig?: string | false
+}
 
 export type ParameterClassification =
   | "newly-unreachable"
@@ -96,12 +98,106 @@ interface ReadProbesResult {
 }
 
 export function analyzeFile(options: AnalyzeFileOptions): AnalysisResult {
-  const sourceText = ts.sys.readFile(options.fileName)
+  const fileName = path.resolve(options.fileName)
+  const sourceText = ts.sys.readFile(fileName)
   if (sourceText === undefined) {
-    throw new Error(`Could not read ${options.fileName}`)
+    throw new Error(`Could not read ${fileName}`)
   }
 
-  return analyzeSource({...options, sourceText})
+  const configured = loadCompilerOptions(fileName, options.tsconfig)
+  const result = analyzeSource({
+    fileName,
+    sourceText,
+    functionName: options.functionName,
+    typeText: options.typeText,
+    compilerOptions: {
+      ...configured.options,
+      ...options.compilerOptions,
+    },
+  })
+  result.diagnostics.unshift(...configured.diagnostics)
+  return result
+}
+
+export function formatAnalysisResult(result: AnalysisResult): string {
+  const lines = [
+    `${result.fileName}:${result.functionName} (T = ${result.typeText})`,
+  ]
+
+  if (result.branches.length === 0) {
+    lines.push("No supported branches analyzed.")
+  } else {
+    for (const branch of result.branches) {
+      lines.push("", `${branch.line}:${branch.character} if (${branch.condition})`)
+      for (const edge of branch.edges) {
+        lines.push(`  ${edge.edge}: ${formatClassification(edge.classification)}`)
+        for (const parameter of edge.parameters) {
+          lines.push(
+            `    ${parameter.name}: ${parameter.baselineType} -> ${parameter.edgeType}`
+            + ` [${parameter.classification}]`,
+          )
+        }
+      }
+    }
+  }
+
+  if (result.unsupported.length > 0) {
+    lines.push("", `Unsupported (${result.unsupported.length}):`)
+    for (const unsupported of result.unsupported) {
+      lines.push(`  ${unsupported.line}:${unsupported.character} ${unsupported.reason}`)
+    }
+  }
+
+  if (result.diagnostics.length > 0) {
+    lines.push("", `Diagnostics (${result.diagnostics.length}):`)
+    for (const diagnostic of result.diagnostics) {
+      const location = diagnostic.line === undefined
+        ? ""
+        : `${diagnostic.line}:${diagnostic.character ?? 1} `
+      const generated = diagnostic.generated ? " [generated]" : ""
+      lines.push(
+        `  ${location}${diagnostic.category} TS${diagnostic.code}: ${diagnostic.message}${generated}`,
+      )
+    }
+  }
+
+  return lines.join("\n")
+}
+
+function formatClassification(classification: ParameterClassification): string {
+  return classification.replaceAll("-", " ").toUpperCase()
+}
+
+function loadCompilerOptions(
+  fileName: string,
+  tsconfig: string | false | undefined,
+): {options: ts.CompilerOptions; diagnostics: AnalysisDiagnostic[]} {
+  if (tsconfig === false) {
+    return {options: {}, diagnostics: []}
+  }
+
+  const configFileName = typeof tsconfig === "string"
+    ? path.resolve(tsconfig)
+    : ts.findConfigFile(path.dirname(fileName), ts.sys.fileExists)
+  if (configFileName === undefined) {
+    return {options: {}, diagnostics: []}
+  }
+
+  const readResult = ts.readConfigFile(configFileName, ts.sys.readFile)
+  if (readResult.error) {
+    return {options: {}, diagnostics: [formatUnmappedDiagnostic(readResult.error)]}
+  }
+  const parsed = ts.parseJsonConfigFileContent(
+    readResult.config,
+    ts.sys,
+    path.dirname(configFileName),
+    undefined,
+    configFileName,
+  )
+  return {
+    options: parsed.options,
+    diagnostics: parsed.errors.map(formatUnmappedDiagnostic),
+  }
 }
 
 export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
@@ -514,6 +610,20 @@ function formatDiagnostic(
     if (mapped.generated) {
       result.generated = true
     }
+  }
+  return result
+}
+
+function formatUnmappedDiagnostic(diagnostic: ts.Diagnostic): AnalysisDiagnostic {
+  const result: AnalysisDiagnostic = {
+    category: ts.DiagnosticCategory[diagnostic.category].toLowerCase(),
+    code: diagnostic.code,
+    message: ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+  }
+  if (diagnostic.file && diagnostic.start !== undefined) {
+    const location = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start)
+    result.line = location.line + 1
+    result.character = location.character + 1
   }
   return result
 }

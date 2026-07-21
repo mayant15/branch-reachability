@@ -12,15 +12,20 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 ## Current Status
 
-**Phase 1 is complete.** The implementation lives in `index.ts` and exposes:
+**Phases 1 and 2 are complete.** The implementation lives in `index.ts` and exposes:
 
 - `analyzeSource`, for analyzing supplied TypeScript source text without writing it to disk;
-- `analyzeFile`, for loading a file and passing it through the same analysis;
+- `analyzeFile`, for loading a file, finding its nearest `tsconfig.json`, and passing it through the same analysis;
+- `formatAnalysisResult`, for deterministic human-readable output;
 - structured branch, edge, parameter, diagnostic, and unsupported-construct results.
+
+The `cli.ts` entry point is available through `npm run analyze -- [options] <file> <function>`. It supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`.
 
 The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes block-contained `if` statements with block-bodied edges. Existing annotations are replaced rather than preserved. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Thirteen tests in `index.test.ts` cover Phase 1 behavior. `npm test`, strict TypeScript checking, and `git diff --check` pass as of the Phase 1 implementation.
+Seventeen tests in `index.test.ts` cover Phases 1 and 2. `npm test`, strict TypeScript checking, CLI help execution, and `git diff --check` pass as of the Phase 2 implementation.
+
+The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
 ## Compiler API Strategy
 
@@ -139,15 +144,16 @@ Acceptance criteria:
 - [x] Unsupported rest, defaulted, destructured, `this`, or modified parameters reject the entire function.
 - [x] User-authored marker-like expressions cannot collide with generated probes.
 
-### Phase 2: Make the analysis usable — Next
+### Phase 2: Make the analysis usable — Complete
 
-- [ ] Add a small CLI for file, function, and type selection.
-- [ ] Add human-readable output; the structured result types already exist.
-- [ ] Load compiler options from the nearest `tsconfig.json` when present, with explicit defaults for standalone fixtures.
+- [x] Add a small CLI for file, function, and type selection.
+- [x] Add deterministic human-readable output alongside JSON structured output.
+- [x] Load compiler options from the nearest `tsconfig.json` when present, with explicit defaults for standalone fixtures.
+- [x] Support an explicit config path and an option to disable config discovery.
 - [x] Report “unsupported” separately from “reachable”; never silently skip a parameter or branch.
 - [x] Add focused tests around source edits, marker lookup, diagnostics, symbol binding, and location mapping.
 
-### Phase 3: Expand `if` coverage
+### Phase 3: Expand `if` coverage — Next
 
 Add one construct at a time with semantic-preservation tests:
 
@@ -230,6 +236,14 @@ Maintain small source fixtures covering:
 - recursive calls and traversal limits.
 
 Every regression test should assert structured classifications and original source locations, not only formatted type strings.
+
+Current coverage is split between:
+
+- `index.test.ts`: 17 automated API, compiler-host, formatting, configuration, and CLI integration tests;
+- `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
+- `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
+- `tests/unsupported.ts`: rest, defaulted, destructured, explicit-`this`, and unbraced unsupported examples;
+- `tests/README.md`: commands for human-readable, JSON, custom-type, diagnostic, and unsupported runs.
 
 ## Risks and Guardrails
 

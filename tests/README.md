@@ -1,0 +1,82 @@
+# CLI Examples
+
+Run these commands from the repository root.
+
+## Impossible `typeof` edge
+
+The default configured type is `string`, even though `value` is originally annotated as `number`. The true edge becomes `never`.
+
+```sh
+npm run analyze -- tests/basic.ts classify
+```
+
+## Multiple parameters
+
+Every parameter is replaced with `string`. The outer true edge is reachable, while the nested `count`-is-a-number edge and the outer false edge are unreachable.
+
+```sh
+npm run analyze -- tests/multiple-parameters.ts compare
+```
+
+Use `--json` to inspect the structured result:
+
+```sh
+npm run analyze -- --json tests/multiple-parameters.ts compare
+```
+
+## Inherited unreachable branches
+
+With the default `string` input, the outer number edge is unreachable. Both edges of the nested branch inherit that impossibility.
+
+```sh
+npm run analyze -- tests/nested.ts inspect
+```
+
+Analyze the same function with its original union instead:
+
+```sh
+npm run analyze -- --type 'string | number' tests/nested.ts inspect
+```
+
+## Discriminated union narrowing
+
+Pass an object union as the configured input type. Both top-level edges remain reachable and show their narrowed object variants.
+
+```sh
+npm run analyze -- \
+  --type '{kind: "text"; value: string} | {kind: "count"; value: number}' \
+  tests/discriminated-union.ts render
+```
+
+## Counterfactual diagnostics
+
+Replacing `value: number` with the default `string` makes the assignment `value = 123` invalid. The branch result is still reported, followed by TypeScript diagnostic TS2322 at the original source location.
+
+```sh
+npm run analyze -- tests/diagnostics.ts assignNumber
+```
+
+An invalid configured type also produces a diagnostic marked as originating in generated analysis text:
+
+```sh
+npm run analyze -- --type 'MissingType' tests/basic.ts classify
+```
+
+## Unsupported functions and branches
+
+Phase 1 requires every parameter to be a simple identifier without rest syntax or a default. Each of these commands rejects the entire selected function and explains why:
+
+```sh
+npm run analyze -- tests/unsupported.ts restParameter
+npm run analyze -- tests/unsupported.ts defaultParameter
+npm run analyze -- tests/unsupported.ts destructuredParameter
+npm run analyze -- tests/unsupported.ts explicitThis
+```
+
+Unbraced branch bodies are reported as unsupported while the function itself remains analyzable:
+
+```sh
+npm run analyze -- tests/unsupported.ts unbracedBranch
+```
+
+The reachability fixtures use block-bodied `if` statements and simple identifier parameters. `unsupported.ts` intentionally violates those constraints to demonstrate the analyzer's unsupported-construct reporting.

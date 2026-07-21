@@ -1,6 +1,10 @@
 import assert from "node:assert/strict"
+import {mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs"
+import {tmpdir} from "node:os"
+import path from "node:path"
+import {spawnSync} from "node:child_process"
 import test from "node:test"
-import {analyzeSource} from "./index.ts"
+import {analyzeFile, analyzeSource, formatAnalysisResult} from "./index.ts"
 
 function analyze(sourceText: string, typeText = "string") {
   return analyzeSource({
@@ -222,4 +226,95 @@ function target(value) {
   assert.equal(result.branches.length, 0)
   assert.equal(result.unsupported.length, 1)
   assert.match(result.unsupported[0].reason, /block-bodied/)
+})
+
+test("formats a deterministic human-readable report", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "number") {
+    console.log(value)
+  }
+}
+`)
+  const output = formatAnalysisResult(result)
+
+  assert.match(output, /fixture\.ts:target \(T = string\)/)
+  assert.match(output, /3:3 if \(typeof value === "number"\)/)
+  assert.match(output, /true: NEWLY UNREACHABLE/)
+  assert.match(output, /value: string -> never \[newly-unreachable\]/)
+})
+
+test("analyzeFile loads the nearest tsconfig and leaves the source unchanged", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-"))
+  try {
+    const fileName = path.join(directory, "fixture.ts")
+    const source = `export function target(value: number) {
+  const unused = 1
+  if (typeof value === "number") {
+    console.log(value)
+  }
+}
+`
+    writeFileSync(fileName, source)
+    writeFileSync(
+      path.join(directory, "tsconfig.json"),
+      JSON.stringify({compilerOptions: {noUnusedLocals: true}}),
+    )
+
+    const result = analyzeFile({fileName, functionName: "target"})
+
+    assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 6133), true)
+    assert.equal(readFileSync(fileName, "utf8"), source)
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("analyzeFile can disable tsconfig discovery", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-"))
+  try {
+    const fileName = path.join(directory, "fixture.ts")
+    writeFileSync(fileName, `export function target(value) {
+  const unused = 1
+  if (typeof value === "string") {
+    console.log(value)
+  }
+}
+`)
+    writeFileSync(
+      path.join(directory, "tsconfig.json"),
+      JSON.stringify({compilerOptions: {noUnusedLocals: true}}),
+    )
+
+    const result = analyzeFile({fileName, functionName: "target", tsconfig: false})
+
+    assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 6133), false)
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("CLI emits structured JSON", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-"))
+  try {
+    const fileName = path.join(directory, "fixture.ts")
+    writeFileSync(fileName, `function target(value) {
+  if (typeof value === "number") {
+    console.log(value)
+  }
+}
+`)
+    const execution = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "cli.ts", "--no-project", "--json", fileName, "target"],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+
+    assert.equal(execution.status, 0, execution.stderr)
+    const result = JSON.parse(execution.stdout)
+    assert.equal(result.functionName, "target")
+    assert.equal(result.branches[0].edges[0].classification, "newly-unreachable")
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
 })
