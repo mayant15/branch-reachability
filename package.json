@@ -4,15 +4,17 @@
   "description": "",
   "main": "index.ts",
   "scripts": {
-    "test": "echo \"no tests.\""
+    "test": "node --experimental-strip-types --test index.test.ts"
   },
   "license": "ISC",
   "type": "module",
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "@typescript/native-preview": "7.0.0-dev.20260707.2",
     "js-yaml": "4.1.0"
   },
   "dependencies": {
+    "@types/js-yaml": "^4.0.9",
     "typescript": "6.0.3"
   }
 }

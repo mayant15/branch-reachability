@@ -1,0 +1,225 @@
+import assert from "node:assert/strict"
+import test from "node:test"
+import {analyzeSource} from "./index.ts"
+
+function analyze(sourceText: string, typeText = "string") {
+  return analyzeSource({
+    fileName: "/virtual/fixture.ts",
+    sourceText,
+    functionName: "target",
+    typeText,
+  })
+}
+
+test("overrides an existing annotation and detects a never true edge", () => {
+  const source = `
+function target(value: number) {
+  if (typeof value === "number") {
+    console.log(value)
+  } else {
+    console.log(value)
+  }
+}
+`
+  const result = analyze(source)
+
+  assert.equal(result.branches.length, 1)
+  assert.deepEqual(
+    result.branches[0].edges.map(edge => [edge.edge, edge.classification]),
+    [["true", "newly-unreachable"], ["false", "reachable"]],
+  )
+  assert.equal(result.branches[0].edges[0].parameters[0].baselineType, "string")
+  assert.equal(result.branches[0].edges[0].parameters[0].edgeType, "never")
+  assert.equal(result.branches[0].line, 3)
+  assert.equal(source.includes(": number"), true)
+})
+
+test("detects a never false edge", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "string") {
+    console.log(value)
+  } else {
+    console.log(value)
+  }
+}
+`)
+
+  assert.deepEqual(
+    result.branches[0].edges.map(edge => [edge.edge, edge.classification]),
+    [["true", "reachable"], ["false", "newly-unreachable"]],
+  )
+})
+
+test("records all parameters and marks an edge unreachable if one becomes never", () => {
+  const result = analyze(`
+function target(value, other: boolean) {
+  if (typeof value === "number") {
+    console.log(value, other)
+  } else {
+    console.log(value, other)
+  }
+}
+`)
+  const trueEdge = result.branches[0].edges[0]
+
+  assert.equal(trueEdge.classification, "newly-unreachable")
+  assert.deepEqual(trueEdge.parameters.map(parameter => parameter.name), ["value", "other"])
+  assert.deepEqual(trueEdge.parameters.map(parameter => parameter.baselineType), ["string", "string"])
+  assert.deepEqual(trueEdge.parameters.map(parameter => parameter.edgeType), ["never", "string"])
+})
+
+test("classifies nested branches below an impossible edge as inherited unreachable", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "number") {
+    if (value === 1) {
+      console.log(value)
+    } else {
+      console.log(value)
+    }
+  } else {
+    console.log(value)
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 2)
+  const nested = result.branches.find(branch => branch.condition === "value === 1")!
+  assert.equal(nested.edges[0].parameters[0].baselineType, "never")
+  assert.equal(nested.edges[0].classification, "inherited-unreachable")
+  assert.equal(nested.edges[1].classification, "inherited-unreachable")
+})
+
+test("does not analyze branches in nested functions", () => {
+  const result = analyze(`
+function target(value) {
+  function nested(value: number) {
+    if (typeof value === "number") {
+      console.log(value)
+    }
+  }
+  if (typeof value === "string") {
+    console.log(value)
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 1)
+  assert.equal(result.branches[0].condition, 'typeof value === "string"')
+})
+
+test("reports a branch unsupported when a local shadows a parameter probe", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "string") {
+    let value = 1
+    console.log(value)
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 0)
+  assert.equal(result.unsupported.length, 1)
+  assert.match(result.unsupported[0].reason, /shadowed/)
+})
+
+test("newly unreachable takes precedence when another parameter is inherited", () => {
+  const result = analyze(`
+function target(first, second) {
+  if (typeof first === "number") {
+    if (typeof second === "number") {
+      console.log(first, second)
+    }
+  }
+}
+`)
+  const nested = result.branches.find(branch => branch.condition === 'typeof second === "number"')!
+
+  assert.deepEqual(
+    nested.edges[0].parameters.map(parameter => parameter.classification),
+    ["inherited-unreachable", "newly-unreachable"],
+  )
+  assert.equal(nested.edges[0].classification, "newly-unreachable")
+})
+
+test("retains diagnostics from the counterfactual program", () => {
+  const result = analyze(`
+function target(value: number) {
+  value = 123
+  if (typeof value === "string") {
+    console.log(value)
+  }
+}
+`)
+
+  const diagnostic = result.diagnostics.find(diagnostic => diagnostic.code === 2322)
+  assert.ok(diagnostic)
+  assert.equal(diagnostic.line, 3)
+  assert.equal(diagnostic.generated, undefined)
+})
+
+test("rejects the entire function when any parameter cannot be overridden", () => {
+  const result = analyze(`
+function target(value, ...rest: number[]) {
+  if (typeof value === "string") {
+    console.log(value, rest)
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 0)
+  assert.equal(result.unsupported.length, 1)
+  assert.match(result.unsupported[0].reason, /All parameters/)
+})
+
+test("retains original diagnostics when a function parameter is unsupported", () => {
+  const result = analyze(`
+function target(value, ...rest: number[]) {
+  const broken: number = "wrong"
+  console.log(value, rest, broken)
+}
+`)
+
+  assert.equal(result.branches.length, 0)
+  assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 2322), true)
+})
+
+test("rejects parameter modifiers", () => {
+  const result = analyze(`
+function target(public value: number) {
+  if (typeof value === "string") {
+    console.log(value)
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 0)
+  assert.equal(result.unsupported.length, 1)
+})
+
+test("does not confuse user-authored marker-like arrays with probes", () => {
+  const result = analyze(`
+const marker = ["__branch_reachability_probe_0", "not a probe"]
+function target(value) {
+  if (typeof value === "string") {
+    console.log(value, marker)
+  }
+}
+`)
+
+  assert.equal(result.branches.length, 1)
+  assert.equal(result.branches[0].edges[0].classification, "reachable")
+})
+
+test("reports unsupported branch shapes instead of partially instrumenting them", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "string") console.log(value)
+}
+`)
+
+  assert.equal(result.branches.length, 0)
+  assert.equal(result.unsupported.length, 1)
+  assert.match(result.unsupported[0].reason, /block-bodied/)
+})
