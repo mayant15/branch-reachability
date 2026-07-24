@@ -3,6 +3,8 @@
 Use TypeScript's API to detect "difficult" branches taking advantage of TypeScript's built-in
 type narrowing capabilities.
 
+[Generated with Amp](https://ampcode.com/threads/T-019f85c6-4f88-72c1-a97e-43f5b59c40b7).
+
 ## Algorithm
 - Add a type annotation to all function inputs: a configurable `T` (start with `string`)
 - Before each branch record the inferred type of all function inputs

@@ -23,9 +23,11 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 The `cli.ts` entry point is available through `npm run analyze`. File mode supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`. Package mode accepts `--package`, `--export`, `--max-depth`, and `--max-functions`. Both modes accept `--sql <path>` to transactionally upsert edge rows into SQLite.
 
+The `coverage.ts` entry point is available through `npm run coverage`. It imports raw V8 coverage reports into an edge database, matching only true/false edges by exact or smallest-containing original-source spans and summing unambiguous counts across reports.
+
 The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Forty tests in `index.test.ts` cover Phases 1 through 5, tabular edge output, and SQLite persistence. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
+Forty-two tests in `index.test.ts` cover Phases 1 through 5, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -266,7 +268,8 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 40 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, `console.table` formatting, SQLite persistence, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
+- `index.test.ts`: 42 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, `console.table` formatting, SQLite persistence, V8 coverage import, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
+- `coverage/v8/js-yaml`: five committed raw V8 reports exercised by the coverage-import regression test;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
 - `tests/javascript.js`: JavaScript analysis with existing JSDoc and CommonJS export syntax;

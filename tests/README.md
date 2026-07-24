@@ -113,6 +113,28 @@ sqlite3 ./edges.sqlite \
   'SELECT edge_id, edge, probed_types, parent_edge_id FROM edges;'
 ```
 
+## V8 coverage import
+
+After creating an edge database, import one raw `NODE_V8_COVERAGE` report or a
+directory of reports. Directory inputs are searched recursively, and hit counts
+from all reports are summed:
+
+```sh
+npm run coverage -- ./js-yaml-edges.sqlite ./coverage/v8/js-yaml
+```
+
+The importer replaces the database's `edge_coverage` table. It only includes
+true and false edges with an exact or smallest-containing V8 range; baselines,
+unmatched edges, and equally specific ranges with conflicting counts are omitted.
+
+```sh
+sqlite3 ./js-yaml-edges.sqlite '
+  SELECT edges.edge_id, edges.edge, edge_coverage.hit_count
+  FROM edge_coverage JOIN edges USING (edge_id)
+  ORDER BY edges.start_offset;
+'
+```
+
 ## Unsupported functions and branches
 
 Phase 1 requires every parameter to be a simple identifier without rest syntax or a default. Each of these commands rejects the entire selected function and explains why:

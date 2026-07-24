@@ -5,6 +5,7 @@
   "main": "index.ts",
   "scripts": {
     "analyze": "node cli.ts",
+    "coverage": "node coverage.ts",
     "test": "node --test index.test.ts"
   },
   "license": "ISC",

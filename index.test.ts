@@ -4,10 +4,13 @@ import {tmpdir} from "node:os"
 import path from "node:path"
 import {spawnSync} from "node:child_process"
 import {DatabaseSync} from "node:sqlite"
+import {fileURLToPath, pathToFileURL} from "node:url"
 import test from "node:test"
 import ts from "typescript"
+import {importV8Coverage} from "./coverage.ts"
 import {analyzePackageExport, formatPackageAnalysisResult} from "./discovery.ts"
 import {analyzeFile, analyzeSource, getAnalysisTableRows} from "./index.ts"
+import {writeAnalysesToSqlite} from "./sqlite-output.ts"
 
 function analyze(sourceText: string, typeText = "string") {
   return analyzeSource({
@@ -730,6 +733,146 @@ test("CLI writes console.table rows to SQLite", () => {
       assert.equal(invalidParents.count, 0)
     } finally {
       database.close()
+    }
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("coverage CLI imports exact and smallest containing V8 hit counts", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-coverage-"))
+  try {
+    const databasePath = path.join(directory, "edges.sqlite")
+    const sourcePath = path.join(directory, "source.js")
+    const coveragePath = path.join(directory, "coverage.json")
+    const database = new DatabaseSync(databasePath)
+    try {
+      database.exec(`
+        CREATE TABLE edges (
+          edge_id TEXT PRIMARY KEY,
+          edge TEXT NOT NULL,
+          file_name TEXT NOT NULL,
+          start_offset INTEGER NOT NULL,
+          end_offset INTEGER NOT NULL
+        );
+      `)
+      const insert = database.prepare("INSERT INTO edges VALUES (?, ?, ?, ?, ?)")
+      insert.run("baseline", "baseline", sourcePath, 10, 20)
+      insert.run("exact", "true", sourcePath, 20, 30)
+      insert.run("containing", "true", sourcePath, 40, 50)
+      insert.run("continuation", "false", sourcePath, 60, 60)
+      insert.run("ambiguous", "false", sourcePath, 70, 80)
+      insert.run("unmatched", "true", sourcePath, 100, 110)
+    } finally {
+      database.close()
+    }
+    writeFileSync(coveragePath, JSON.stringify({result: [{
+      url: pathToFileURL(sourcePath).href,
+      functions: [{ranges: [
+        {startOffset: 0, endOffset: 90, count: 1},
+        {startOffset: 20, endOffset: 30, count: 7},
+        {startOffset: 38, endOffset: 52, count: 5},
+        {startOffset: 60, endOffset: 60, count: 3},
+        {startOffset: 68, endOffset: 82, count: 2},
+        {startOffset: 69, endOffset: 83, count: 4},
+      ]}],
+    }]}))
+
+    const execution = spawnSync(
+      process.execPath,
+      ["coverage.ts", databasePath, coveragePath],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+    assert.equal(execution.status, 0, execution.stderr)
+    assert.match(execution.stdout, /coveredEdges/)
+
+    const resultDatabase = new DatabaseSync(databasePath)
+    try {
+      const rows = resultDatabase.prepare(`
+        SELECT edge_id, hit_count FROM edge_coverage ORDER BY edge_id
+      `).all().map(row => ({...row}))
+      assert.deepEqual(rows, [
+        {edge_id: "containing", hit_count: 5},
+        {edge_id: "continuation", hit_count: 3},
+        {edge_id: "exact", hit_count: 7},
+      ])
+    } finally {
+      resultDatabase.close()
+    }
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("imports the saved js-yaml V8 coverage reports", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-js-yaml-coverage-"))
+  try {
+    const databasePath = path.join(directory, "edges.sqlite")
+    const loaderPath = path.resolve("node_modules/js-yaml/lib/loader.js")
+    writeAnalysesToSqlite(databasePath, [
+      analyzeFile({fileName: loaderPath, functionName: "load"}),
+      analyzeFile({fileName: loaderPath, functionName: "loadDocuments"}),
+    ])
+
+    // Raw V8 reports retain the absolute path of the checkout that produced
+    // them. Preserve that source identity in the temporary edge database so
+    // this committed fixture remains runnable from any checkout location.
+    const fixtureDirectory = path.resolve("coverage/v8/js-yaml")
+    const singleReport = JSON.parse(readFileSync(
+      path.join(fixtureDirectory, "single/coverage-15268-1784914056497-0.json"),
+      "utf8",
+    )) as {result: Array<{url: string}>}
+    const capturedUrl = singleReport.result.find(script =>
+      script.url.endsWith("/node_modules/js-yaml/lib/loader.js")
+    )?.url
+    assert.ok(capturedUrl)
+    const database = new DatabaseSync(databasePath)
+    try {
+      database.prepare("UPDATE edges SET file_name = ? WHERE file_name = ?")
+        .run(fileURLToPath(capturedUrl), loaderPath)
+    } finally {
+      database.close()
+    }
+
+    const result = importV8Coverage(databasePath, [fixtureDirectory])
+    assert.deepEqual(result, {
+      databasePath,
+      coverageFiles: 5,
+      candidateEdges: 12,
+      coveredEdges: 12,
+    })
+
+    const resultDatabase = new DatabaseSync(databasePath)
+    try {
+      const rows = resultDatabase.prepare(`
+        SELECT e.function_name, e.edge, e.start_offset, e.end_offset, c.hit_count
+        FROM edge_coverage AS c
+        JOIN edges AS e USING (edge_id)
+        ORDER BY e.function_name, e.start_offset, e.edge
+      `).all().map(row => ({...row}))
+      assert.deepEqual(rows, [
+        {function_name: "load", edge: "true", start_offset: 46858, end_offset: 46921, hit_count: 1},
+        {function_name: "load", edge: "false", start_offset: 46927, end_offset: 46985, hit_count: 3},
+        {function_name: "load", edge: "true", start_offset: 46955, end_offset: 46985, hit_count: 2},
+        {function_name: "load", edge: "false", start_offset: 46985, end_offset: 46985, hit_count: 0},
+        {function_name: "loadDocuments", edge: "true", start_offset: 45491, end_offset: 45784, hit_count: 4},
+        {function_name: "loadDocuments", edge: "true", start_offset: 45656, end_offset: 45684, hit_count: 2},
+        {function_name: "loadDocuments", edge: "false", start_offset: 45684, end_offset: 45684, hit_count: 2},
+        {function_name: "loadDocuments", edge: "true", start_offset: 45743, end_offset: 45780, hit_count: 1},
+        {function_name: "loadDocuments", edge: "false", start_offset: 45780, end_offset: 45780, hit_count: 1},
+        {function_name: "loadDocuments", edge: "false", start_offset: 45784, end_offset: 45784, hit_count: 4},
+        {function_name: "loadDocuments", edge: "true", start_offset: 45888, end_offset: 45983, hit_count: 1},
+        {function_name: "loadDocuments", edge: "false", start_offset: 45983, end_offset: 45983, hit_count: 0},
+      ])
+      const baselineCount = resultDatabase.prepare(`
+        SELECT COUNT(*) AS count
+        FROM edge_coverage AS c
+        JOIN edges AS e USING (edge_id)
+        WHERE e.edge = 'baseline'
+      `).get() as {count: number}
+      assert.equal(baselineCount.count, 0)
+    } finally {
+      resultDatabase.close()
     }
   } finally {
     rmSync(directory, {recursive: true, force: true})
