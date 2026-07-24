@@ -90,6 +90,29 @@ Structured package results include export-resolution steps, complete per-functio
 npm run analyze -- --package js-yaml --export load --max-depth 1 --json
 ```
 
+## SQLite output
+
+Persist the same edge rows shown by `console.table` into an `edges` table. Re-running an analysis updates rows with the same location-derived `edge_id`.
+
+```sh
+npm run analyze -- --sql ./edges.sqlite tests/basic.ts classify
+```
+
+The flag also works in package mode and writes rows for every analyzed function:
+
+```sh
+npm run analyze -- \
+  --package js-yaml --export load --max-depth 1 \
+  --sql ./js-yaml-edges.sqlite
+```
+
+For example, inspect parent relationships with the SQLite CLI:
+
+```sh
+sqlite3 ./edges.sqlite \
+  'SELECT edge_id, edge, probed_types, parent_edge_id FROM edges;'
+```
+
 ## Unsupported functions and branches
 
 Phase 1 requires every parameter to be a simple identifier without rest syntax or a default. Each of these commands rejects the entire selected function and explains why:

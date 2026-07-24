@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.ts",
   "scripts": {
-    "analyze": "node --experimental-strip-types cli.ts",
-    "test": "node --experimental-strip-types --test index.test.ts"
+    "analyze": "node cli.ts",
+    "test": "node --test index.test.ts"
   },
   "license": "ISC",
   "type": "module",

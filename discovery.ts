@@ -78,6 +78,9 @@ interface DirectCalls {
   unresolved: UnresolvedCall[]
 }
 
+/**
+ * Entry point for function discovery.
+ */
 export function analyzePackageExport(
   options: AnalyzePackageExportOptions,
 ): PackageAnalysisResult {

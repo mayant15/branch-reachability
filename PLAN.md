@@ -16,16 +16,16 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 - `analyzeSource`, for analyzing supplied TypeScript source text without writing it to disk;
 - `analyzeFile`, for loading a file, finding its nearest `tsconfig.json`, and passing it through the same analysis;
-- `formatAnalysisResult`, for deterministic human-readable output;
+- `getAnalysisTableRows` and `printAnalysisResult`, for deterministic `console.table` output;
 - structured branch, edge, parameter, diagnostic, and unsupported-construct results.
 
 `discovery.ts` exposes `analyzePackageExport` and `formatPackageAnalysisResult` for CommonJS package-export resolution and bounded direct-call traversal.
 
-The `cli.ts` entry point is available through `npm run analyze`. File mode supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`. Package mode accepts `--package`, `--export`, `--max-depth`, and `--max-functions`.
+The `cli.ts` entry point is available through `npm run analyze`. File mode supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`. Package mode accepts `--package`, `--export`, `--max-depth`, and `--max-functions`. Both modes accept `--sql <path>` to transactionally upsert edge rows into SQLite.
 
 The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Thirty-seven tests in `index.test.ts` cover Phases 1 through 5. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass as of the Phase 5 implementation.
+Forty tests in `index.test.ts` cover Phases 1 through 5, tabular edge output, and SQLite persistence. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -90,8 +90,11 @@ Keep the first implementation small, but separate these responsibilities so the 
    - Return structured results plus syntactic and semantic diagnostics.
 
 5. **Reporter**
-   - Start with deterministic JSON-friendly records and a concise terminal rendering.
-   - Include target, branch location, edge, baseline/edge types per parameter, classification, diagnostics, and unsupported constructs.
+   - Emit deterministic JSON-friendly records and a terminal table rendered with `console.table`.
+   - Represent every branch baseline and true/false edge as a row with a location-derived `edge_id`, original start/end line, column and offset, probed types, and `parent_edge_id`.
+   - True/false rows reference their branch's baseline row; baseline rows have no parent.
+   - Retain classifications in structured results and append diagnostics and unsupported constructs after the table.
+   - Persist the same rows with `--sql` using Node's built-in SQLite support, including source/function/type context and baseline-parent foreign keys.
 
 6. **Function discovery**
    - Resolve package exports, CommonJS forwarding assignments, local calls, and recursively discovered declarations.
@@ -263,7 +266,7 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 37 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, formatting, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
+- `index.test.ts`: 40 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, `console.table` formatting, SQLite persistence, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
 - `tests/javascript.js`: JavaScript analysis with existing JSDoc and CommonJS export syntax;

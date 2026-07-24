@@ -1,6 +1,7 @@
 import {parseArgs} from "node:util"
 import {analyzePackageExport, formatPackageAnalysisResult} from "./discovery.ts"
-import {analyzeFile, formatAnalysisResult} from "./index.ts"
+import {analyzeFile, printAnalysisResult} from "./index.ts"
+import {writeAnalysesToSqlite, writeAnalysisToSqlite} from "./sqlite-output.ts"
 
 const usage = `Usage:
   npm run analyze -- [options] <file> <function>
@@ -16,6 +17,7 @@ Options:
   --export <name>     CommonJS package export to discover
   --max-depth <n>     Maximum direct-call traversal depth (default: 3)
   --max-functions <n> Maximum functions to analyze (default: 50)
+  --sql <path>        Upsert edge rows into a SQLite database
   --json              Print the structured result as JSON
   -h, --help          Show this help`
 
@@ -31,6 +33,7 @@ try {
       export: {type: "string"},
       "max-depth": {type: "string"},
       "max-functions": {type: "string"},
+      sql: {type: "string"},
       json: {type: "boolean"},
       help: {type: "boolean", short: "h"},
     },
@@ -55,6 +58,12 @@ try {
       maxDepth: parseIntegerOption("--max-depth", parsed.values["max-depth"]),
       maxFunctions: parseIntegerOption("--max-functions", parsed.values["max-functions"]),
     })
+    if (parsed.values.sql) {
+      writeAnalysesToSqlite(
+        parsed.values.sql,
+        result.functions.map(discovered => discovered.analysis),
+      )
+    }
     console.log(
       parsed.values.json ? JSON.stringify(result, null, 2) : formatPackageAnalysisResult(result),
     )
@@ -75,7 +84,14 @@ try {
       typeText: parsed.values.type,
       tsconfig: parsed.values["no-project"] ? false : parsed.values.project,
     })
-    console.log(parsed.values.json ? JSON.stringify(result, null, 2) : formatAnalysisResult(result))
+    if (parsed.values.sql) {
+      writeAnalysisToSqlite(parsed.values.sql, result)
+    }
+    if (parsed.values.json) {
+      console.log(JSON.stringify(result, null, 2))
+    } else {
+      printAnalysisResult(result)
+    }
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error))

@@ -3,10 +3,11 @@ import {mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os"
 import path from "node:path"
 import {spawnSync} from "node:child_process"
+import {DatabaseSync} from "node:sqlite"
 import test from "node:test"
 import ts from "typescript"
 import {analyzePackageExport, formatPackageAnalysisResult} from "./discovery.ts"
-import {analyzeFile, analyzeSource, formatAnalysisResult} from "./index.ts"
+import {analyzeFile, analyzeSource, getAnalysisTableRows} from "./index.ts"
 
 function analyze(sourceText: string, typeText = "string") {
   return analyzeSource({
@@ -642,7 +643,7 @@ test("CLI rejects package-only options in file mode", () => {
   assert.match(execution.stderr, /require --package/)
 })
 
-test("formats a deterministic human-readable report", () => {
+test("creates deterministic rows for console.table", () => {
   const result = analyze(`
 function target(value) {
   if (typeof value === "number") {
@@ -650,12 +651,118 @@ function target(value) {
   }
 }
 `)
-  const output = formatAnalysisResult(result)
+  const rows = getAnalysisTableRows(result)
 
-  assert.match(output, /fixture\.ts:target \(T = string\)/)
-  assert.match(output, /3:3 if \(typeof value === "number"\)/)
-  assert.match(output, /true: NEWLY UNREACHABLE/)
-  assert.match(output, /value: string -> never \[newly-unreachable\]/)
+  assert.equal(rows.length, 3)
+  assert.deepEqual(Object.keys(rows[0]), [
+    "edge_id", "edge", "classification",
+    "start_line", "start_col", "end_line", "end_col",
+    "start_offset", "end_offset", "probed_types", "parent_edge_id",
+  ])
+  assert.match(rows[0].edge_id, /^edge_[a-f0-9]{16}$/)
+  assert.equal(rows[0].edge, "baseline")
+  assert.equal(rows[0].start_line, 3)
+  assert.equal(rows[1].edge, "true")
+  assert.equal(rows[1].classification, "newly-unreachable")
+  assert.equal(rows[1].probed_types, "value: never")
+  assert.equal(rows[1].parent_edge_id, rows[0].edge_id)
+})
+
+test("CLI uses console.table for human output", () => {
+  const execution = spawnSync(
+    process.execPath,
+    ["cli.ts", "--no-project", "tests/basic.ts", "classify"],
+    {cwd: path.resolve("."), encoding: "utf8"},
+  )
+
+  assert.equal(execution.status, 0, execution.stderr)
+  assert.match(execution.stdout, /edge_id/)
+  assert.match(execution.stdout, /parent_edge_id/)
+  assert.match(execution.stdout, /edge_[a-f0-9]{16}/)
+  assert.match(execution.stdout, /[┌┬┐]/)
+})
+
+test("CLI writes console.table rows to SQLite", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-sqlite-"))
+  try {
+    const databasePath = path.join(directory, "edges.sqlite")
+    const execution = spawnSync(
+      process.execPath,
+      [
+        "cli.ts", "--no-project", "--sql", databasePath,
+        "tests/basic.ts", "classify",
+      ],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+    assert.equal(execution.status, 0, execution.stderr)
+
+    const database = new DatabaseSync(databasePath)
+    try {
+      const rows = database.prepare(`
+        SELECT edge_id, edge, parent_edge_id, file_name, function_name, type_text
+        FROM edges ORDER BY start_offset, edge
+      `).all() as Array<{
+        edge_id: string
+        edge: string
+        parent_edge_id: string | null
+        file_name: string
+        function_name: string
+        type_text: string
+      }>
+      assert.equal(rows.length, 3)
+      assert.deepEqual(rows.map(row => row.edge).sort(), ["baseline", "false", "true"])
+      const baseline = rows.find(row => row.edge === "baseline")!
+      assert.equal(baseline.parent_edge_id, null)
+      assert.equal(rows.filter(row => row.edge !== "baseline").every(
+        row => row.parent_edge_id === baseline.edge_id
+      ), true)
+      assert.match(baseline.file_name, /tests\/basic\.ts$/)
+      assert.equal(baseline.function_name, "classify")
+      assert.equal(baseline.type_text, "string")
+
+      const invalidParents = database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM edges AS child
+        LEFT JOIN edges AS parent ON parent.edge_id = child.parent_edge_id
+        WHERE child.edge != 'baseline'
+          AND (parent.edge IS NULL OR parent.edge != 'baseline')
+      `).get() as {count: number}
+      assert.equal(invalidParents.count, 0)
+    } finally {
+      database.close()
+    }
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("assigns stable location IDs and baseline parents to edge rows", () => {
+  const source = `function target(value) {
+  if (typeof value === "number") return value
+}`
+  const first = analyze(source)
+  const second = analyze(source)
+  const branch = first.branches[0]
+
+  assert.equal(branch.baseline.edgeId, second.branches[0].baseline.edgeId)
+  assert.equal(branch.baseline.parentEdgeId, null)
+  assert.equal(branch.baseline.location.start.offset, source.indexOf("typeof"))
+  assert.equal(branch.baseline.location.end.offset, source.indexOf(") return"))
+  assert.equal(branch.edges[0].parentEdgeId, branch.baseline.edgeId)
+  assert.equal(branch.edges[1].parentEdgeId, branch.baseline.edgeId)
+  assert.equal(branch.edges[0].location.start.offset, source.indexOf("return"))
+  assert.equal(branch.edges[1].location.start.offset, source.indexOf("return") + "return value".length)
+
+  const rows = getAnalysisTableRows(first)
+  const rowsById = new Map(rows.map(row => [row.edge_id, row]))
+  for (const row of rows) {
+    if (row.edge === "baseline") {
+      assert.equal(row.parent_edge_id, "")
+    } else {
+      assert.notEqual(row.parent_edge_id, "")
+      assert.equal(rowsById.get(row.parent_edge_id)?.edge, "baseline")
+    }
+  }
 })
 
 test("analyzeFile loads the nearest tsconfig and leaves the source unchanged", () => {

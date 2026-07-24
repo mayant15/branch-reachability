@@ -1,5 +1,9 @@
+import {createHash} from "node:crypto"
 import path from "node:path"
 import ts from "typescript"
+
+// Default type annotation for function arguments
+const DEFAULT_TYPE_ANNOTATION = "string"
 
 export interface AnalyzeSourceOptions {
   fileName: string
@@ -26,8 +30,30 @@ export interface ParameterResult {
   classification: ParameterClassification
 }
 
+export interface SourcePosition {
+  line: number
+  character: number
+  offset: number
+}
+
+export interface SourceSpan {
+  start: SourcePosition
+  end: SourcePosition
+}
+
+export interface BaselineResult {
+  edgeId: string
+  edge: "baseline"
+  location: SourceSpan
+  probedTypes: Array<{name: string; type: string}>
+  parentEdgeId: null
+}
+
 export interface EdgeResult {
+  edgeId: string
   edge: "true" | "false"
+  location: SourceSpan
+  parentEdgeId: string
   classification: ParameterClassification
   parameters: ParameterResult[]
 }
@@ -36,6 +62,7 @@ export interface BranchResult {
   line: number
   character: number
   condition: string
+  baseline: BaselineResult
   edges: EdgeResult[]
 }
 
@@ -63,6 +90,20 @@ export interface AnalysisResult {
   unsupported: UnsupportedConstruct[]
 }
 
+export interface AnalysisTableRow {
+  edge_id: string
+  edge: "baseline" | "true" | "false"
+  classification: "" | ParameterClassification
+  start_line: number
+  start_col: number
+  end_line: number
+  end_col: number
+  start_offset: number
+  end_offset: number
+  probed_types: string
+  parent_edge_id: string
+}
+
 interface TextEdit {
   start: number
   end: number
@@ -72,6 +113,8 @@ interface TextEdit {
 
 interface ProbeMetadata {
   id: string
+  edgeId: string
+  location: SourceSpan
   parameterNames: string[]
 }
 
@@ -98,6 +141,9 @@ interface ReadProbesResult {
   invalidProbeIds: Set<string>
 }
 
+/**
+ * Entry point.
+ */
 export function analyzeFile(options: AnalyzeFileOptions): AnalysisResult {
   const fileName = path.resolve(options.fileName)
   const sourceText = ts.sys.readFile(fileName)
@@ -117,32 +163,42 @@ export function analyzeFile(options: AnalyzeFileOptions): AnalysisResult {
       ...options.compilerOptions,
     },
   })
+  // add diagnostics from parsing tsconfig.json
   result.diagnostics.unshift(...configured.diagnostics)
   return result
 }
 
-export function formatAnalysisResult(result: AnalysisResult): string {
-  const lines = [
-    `${result.fileName}:${result.functionName} (T = ${result.typeText})`,
-  ]
+export function getAnalysisTableRows(result: AnalysisResult): AnalysisTableRow[] {
+  return result.branches.flatMap(branch => [
+    toAnalysisTableRow(
+      branch.baseline.edgeId,
+      branch.baseline.edge,
+      "",
+      branch.baseline.location,
+      branch.baseline.probedTypes,
+      branch.baseline.parentEdgeId,
+    ),
+    ...branch.edges.map(edge => toAnalysisTableRow(
+      edge.edgeId,
+      edge.edge,
+      edge.classification,
+      edge.location,
+      edge.parameters.map(parameter => ({name: parameter.name, type: parameter.edgeType})),
+      edge.parentEdgeId,
+    )),
+  ])
+}
 
-  if (result.branches.length === 0) {
-    lines.push("No supported branches analyzed.")
+export function printAnalysisResult(result: AnalysisResult): void {
+  console.log(`${result.fileName}:${result.functionName} (T = ${result.typeText})`)
+  const rows = getAnalysisTableRows(result)
+  if (rows.length > 0) {
+    console.table(rows)
   } else {
-    for (const branch of result.branches) {
-      lines.push("", `${branch.line}:${branch.character} if (${branch.condition})`)
-      for (const edge of branch.edges) {
-        lines.push(`  ${edge.edge}: ${formatClassification(edge.classification)}`)
-        for (const parameter of edge.parameters) {
-          lines.push(
-            `    ${parameter.name}: ${parameter.baselineType} -> ${parameter.edgeType}`
-            + ` [${parameter.classification}]`,
-          )
-        }
-      }
-    }
+    console.log("No supported branches analyzed.")
   }
 
+  const lines: string[] = []
   if (result.unsupported.length > 0) {
     lines.push("", `Unsupported (${result.unsupported.length}):`)
     for (const unsupported of result.unsupported) {
@@ -162,12 +218,52 @@ export function formatAnalysisResult(result: AnalysisResult): string {
       )
     }
   }
-
-  return lines.join("\n")
+  if (lines.length > 0) {
+    console.log(lines.join("\n"))
+  }
 }
 
-function formatClassification(classification: ParameterClassification): string {
-  return classification.replaceAll("-", " ").toUpperCase()
+/**
+ * Each "baseline" branch gets its own row.
+ *
+ * For nested if conditions, the probed type could change *between*
+ * the entry of the parent basic block (__probe_1) and the baseline
+ * for the current branch (__probe_2). So it is not correct for an
+ * edge to have another edge as its parent.
+ * ```ts
+ * if (typeof x === "number") {
+ *   __probe_1(x)
+ *   x = String(x)
+ *   __probe_2(x)
+ *   if (x === "") {}
+ * }
+ * ```
+ */
+function toAnalysisTableRow(
+  edgeId: string,
+  edge: "baseline" | "true" | "false",
+  classification: "" | ParameterClassification,
+  location: SourceSpan,
+  probedTypes: Array<{name: string; type: string}>,
+  parentEdgeId: string | null,
+): AnalysisTableRow {
+  const types = probedTypes
+    .map(probe => `${probe.name}: ${probe.type}`)
+    .join("; ")
+    .replaceAll("\n", " ")
+  return {
+    edge_id: edgeId,
+    edge,
+    classification,
+    start_line: location.start.line,
+    start_col: location.start.character,
+    end_line: location.end.line,
+    end_col: location.end.character,
+    start_offset: location.start.offset,
+    end_offset: location.end.offset,
+    probed_types: types,
+    parent_edge_id: parentEdgeId ?? "",
+  }
 }
 
 function loadCompilerOptions(
@@ -202,9 +298,13 @@ function loadCompilerOptions(
   }
 }
 
+/**
+ * Start analyzing a source file.
+ * TODO: why do I not just read the file in here? instead of passing source text into it?
+ */
 export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
   const fileName = path.resolve(options.fileName)
-  const typeText = options.typeText ?? "string"
+  const typeText = options.typeText ?? DEFAULT_TYPE_ANNOTATION
   const scriptKind = scriptKindForFile(fileName)
   const isJavaScript = scriptKind === ts.ScriptKind.JS || scriptKind === ts.ScriptKind.JSX
   const compilerOptions: ts.CompilerOptions = {
@@ -254,10 +354,12 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     }
   }
 
+  // Add underscores to the prefix if it already exists in the source.
   let probeMarkerPrefix = "__branch_reachability_probe_"
   while (options.sourceText.includes(probeMarkerPrefix)) {
     probeMarkerPrefix = `_${probeMarkerPrefix}`
   }
+
   const branches = planBranches(
     target,
     originalSource,
@@ -425,9 +527,15 @@ function planBranches(
   const branches: PlannedBranch[] = []
   let nextProbeId = 0
 
-  function makeProbe(): {metadata: ProbeMetadata; statement: string} {
+  function makeProbe(
+    edge: "baseline" | "true" | "false",
+    start: number,
+    end: number,
+  ): {metadata: ProbeMetadata; statement: string} {
     const probe = {
       id: `${probeMarkerPrefix}${nextProbeId++}`,
+      edgeId: makeEdgeId(sourceFile.fileName, edge, start, end),
+      location: sourceSpan(sourceFile, start, end),
       parameterNames,
     }
     const elements = [JSON.stringify(probe.id), ...parameterNames].join(", ")
@@ -489,7 +597,11 @@ function planBranches(
   }
 
   function planBaseline(node: ts.IfStatement, depth: number): ProbeMetadata {
-    const probe = makeProbe()
+    const probe = makeProbe(
+      "baseline",
+      node.expression.getStart(sourceFile),
+      node.expression.end,
+    )
     if (isStatementListContainer(node.parent)) {
       insert(
         node.getStart(sourceFile),
@@ -511,8 +623,9 @@ function planBranches(
     statement: ts.Statement,
     depth: number,
     role: number,
+    edge: "true" | "false",
   ): ProbeMetadata {
-    const probe = makeProbe()
+    const probe = makeProbe(edge, statement.getStart(sourceFile), statement.end)
     if (ts.isBlock(statement)) {
       insert(
         statement.getStart(sourceFile) + 1,
@@ -531,7 +644,7 @@ function planBranches(
   }
 
   function planMissingElse(node: ts.IfStatement, depth: number): ProbeMetadata {
-    const probe = makeProbe()
+    const probe = makeProbe("false", node.end, node.end)
     insert(
       node.end,
       ` else {\n${probe.statement}\n}`,
@@ -559,11 +672,11 @@ function planBranches(
           baseline: planBaseline(node, depth),
           edges: [{
             edge: "true",
-            probe: planExistingEdge(node.thenStatement, depth, 1),
+            probe: planExistingEdge(node.thenStatement, depth, 1, "true"),
           }, {
             edge: "false",
             probe: node.elseStatement
-              ? planExistingEdge(node.elseStatement, depth, 2)
+              ? planExistingEdge(node.elseStatement, depth, 2, "false")
               : planMissingElse(node, depth),
           }],
         }
@@ -708,14 +821,61 @@ function classifyBranch(
       : parameters.some(parameter => parameter.classification === "inherited-unreachable")
         ? "inherited-unreachable"
         : "reachable"
-    return {edge, classification, parameters}
+    return {
+      edgeId: probe.edgeId,
+      edge,
+      location: probe.location,
+      parentEdgeId: branch.baseline.edgeId,
+      classification,
+      parameters,
+    }
   })
 
   return {
     line: branch.line,
     character: branch.character,
     condition: branch.condition,
+    baseline: {
+      edgeId: branch.baseline.edgeId,
+      edge: "baseline",
+      location: branch.baseline.location,
+      probedTypes: branch.baseline.parameterNames.map(name => ({
+        name,
+        type: baseline.strings.get(name)!,
+      })),
+      parentEdgeId: null,
+    },
     edges,
+  }
+}
+
+function makeEdgeId(
+  fileName: string,
+  edge: "baseline" | "true" | "false",
+  start: number,
+  end: number,
+): string {
+  const hash = createHash("sha256")
+    .update(`${path.resolve(fileName)}:${start}:${end}:${edge}`)
+    .digest("hex")
+    .slice(0, 16)
+  return `edge_${hash}`
+}
+
+function sourceSpan(sourceFile: ts.SourceFile, start: number, end: number): SourceSpan {
+  const startLocation = sourceFile.getLineAndCharacterOfPosition(start)
+  const endLocation = sourceFile.getLineAndCharacterOfPosition(end)
+  return {
+    start: {
+      line: startLocation.line + 1,
+      character: startLocation.character + 1,
+      offset: start,
+    },
+    end: {
+      line: endLocation.line + 1,
+      character: endLocation.character + 1,
+      offset: end,
+    },
   }
 }
 
