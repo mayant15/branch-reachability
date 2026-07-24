@@ -2,17 +2,21 @@
 
 ## Objective
 
-Build a TypeScript compiler-API prototype that answers this counterfactual question:
+Build a TypeScript compiler-API analysis that answers this counterfactual question:
 
 > If every input to a function had a configured type `T`, which branch edges would TypeScript's control-flow narrowing consider impossible?
 
-The first useful version will analyze one function at a time, use `string` as `T`, and support `if` statements. Later versions will discover callees across files and apply the same intraprocedural analysis to them, with `js-yaml`'s CommonJS `load` implementation as the integration target.
+The completed prototype answers this for one function at a time and has a bounded CommonJS/direct-call discovery experiment. The next version will make a whole reachable library the unit of analysis, then turn the existing traversal experiment into an explicit and progressively broader call graph. `js-yaml`'s CommonJS `load` implementation remains the integration target.
 
 This is an analysis of TypeScript's model, not proof that code is unreachable at runtime. Results must always retain compiler diagnostics and identify unsupported constructs.
 
 ## Current Status
 
-**Phases 1 through 5 are complete, so the initial prototype definition of done is satisfied.** The implementation lives in `index.ts` and exposes:
+**Phases 1 through 5 are complete, so the initial prototype definition of done is satisfied.** Work now moves from a single-function engine and a narrow discovery experiment to library-level analysis and call-graph expansion.
+
+### Implemented baseline
+
+The implementation lives in `index.ts` and exposes:
 
 - `analyzeSource`, for analyzing supplied TypeScript source text without writing it to disk;
 - `analyzeFile`, for loading a file, finding its nearest `tsconfig.json`, and passing it through the same analysis;
@@ -30,6 +34,24 @@ The analyzer currently overrides all supported parameters with configurable `T` 
 Forty-two tests in `index.test.ts` cover Phases 1 through 5, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
+
+### Current boundaries
+
+- Analysis is still intraprocedural: every selected function independently receives the configured `T` for all supported parameters. Caller argument types and caller narrowing are not propagated.
+- Package mode is a prototype specialized to Node's `require` condition, a small set of CommonJS forwarding assignments, and checker-resolved direct calls to local named function declarations.
+- Discovery returns a traversal list with one `discoveredFrom` parent. It does not retain every callsite or represent a reusable many-to-many call graph.
+- Function expressions, arrow functions, methods, constructors, callbacks, imported callees, most property calls, ESM exports, and dynamic dispatch are not resolved as graph nodes.
+- A failure to analyze one discovered function is not yet modeled as a recoverable per-function library result.
+- SQLite stores analysis edges, but not library identities, function nodes, callsites, unresolved-call records, or traversal metadata.
+- V8 coverage is post-processed against original JavaScript offsets. Transpiled sources still require source-map remapping before import.
+
+### Roadmap at a glance
+
+1. **Phase 6 — Library-level analysis:** make an entry point plus its complete *supported reachable function set* one analysis job. Preserve per-function results and failures, and emit one coherent report/database.
+2. **Phase 7 — Call-graph expansion:** promote discovery to explicit function and callsite records, broaden static callee resolution in measured steps, and retain unresolved or ambiguous edges rather than guessing.
+3. **Later contextual analysis:** only after the graph is reliable, evaluate caller-to-callee type specialization, aliases, and object-property provenance as separate experiments.
+
+The boundary between Phases 6 and 7 is deliberate. Phase 6 uses the currently supported traversal to establish the library-level contract. Phase 7 improves which functions and relationships that contract can represent. Neither phase should silently introduce interprocedural type propagation.
 
 ## Compiler API Strategy
 
@@ -234,18 +256,101 @@ Do not rely on the imported `load` symbol in this repository's `index.ts` to fin
 - across those 13 functions, `composeNode` contains one newly unreachable edge at line 1430: the true edge of `CONTEXT_FLOW_IN === nodeContext || CONTEXT_FLOW_OUT === nodeContext` narrows configured `nodeContext: string` to `never`;
 - package resolution uses Node's actual `require` resolver. The supported CommonJS assignment forms are inspected statically; executing package code remains an available future fallback for more dynamic export patterns.
 
-### Phase 6: Evaluate interprocedural value — Next
+### Phase 6: Make the library the unit of analysis — Next
 
-After collecting real `js-yaml` results, decide whether call traversal alone is useful. Independently analyzing callees does not propagate caller argument types, aliases, or object-property provenance.
+#### Goal
 
-Likely next experiments, in increasing complexity, are:
+Given one explicit runtime entry point, analyze every function reachable through the **currently supported** discovery rules and return a single durable library result. This phase productizes orchestration; it does not broaden callee resolution or propagate types between functions.
 
-1. specialize a callee's parameter type from a statically resolved call argument;
-2. analyze each distinct call context with memoization and widening limits;
-3. track a parameter copied into a local variable;
-4. track a parameter stored in an object field, as `js-yaml` does with parser state.
+Supported entry-point forms should share one internal target model:
 
-Each experiment needs a concrete fixture and budget before implementation. Avoid building a general taint engine until direct branch and call-chain results demonstrate the need.
+- package plus export under an explicit runtime condition, initially `require`;
+- source file plus named function and optional declaration position.
+
+The result must preserve:
+
+- library/job identity and entry-point resolution steps;
+- a stable function identity based on canonical source file plus declaration position;
+- one independent `AnalysisResult` per function;
+- depth and discovery provenance;
+- unresolved calls, traversal truncation, unsupported functions, and per-function failures;
+- deterministic ordering independent of filesystem or checker iteration order.
+
+#### Implementation sequence
+
+1. Extract entry resolution, traversal, and per-function analysis orchestration from the js-yaml-specific package path into a general library-analysis API.
+2. Define a structured result in which successful, unsupported, failed, unresolved, and truncated outcomes cannot be confused.
+3. Keep one source-discovery `Program` per library job; continue creating the analyzer's fresh virtual `Program` per function until measurements justify a shared counterfactual program.
+4. Make traversal resilient: one unsupported or failed function must be recorded without discarding successful sibling results.
+5. Add deterministic library-level human and JSON output, with summaries derived from structured records rather than parsed text.
+6. Extend SQLite output with library/function ownership while retaining existing `edges` compatibility and baseline-parent invariants. Design the schema before migration; do not overload `edge_id` to encode graph identity.
+7. Establish fixture libraries that exercise multiple files, repeated callees, recursion, unsupported functions, and partial failures before relying on js-yaml alone.
+
+#### Acceptance criteria
+
+- [ ] One command can analyze a file/function or package/export entry point as a library job.
+- [ ] Every function reachable under the current supported call rules is analyzed at most once by stable identity.
+- [ ] Multiple callers of one function do not duplicate its intraprocedural analysis.
+- [ ] Unsupported or failed functions are retained as explicit records and do not abort unrelated reachable analysis.
+- [ ] Limits produce deterministic truncation records and never silently omit functions.
+- [ ] Human, JSON, and SQLite outputs agree on function, branch, diagnostic, unsupported, unresolved, and truncated counts.
+- [ ] Existing single-function CLI/API behavior remains compatible.
+- [ ] js-yaml `load` produces a stable library-level regression result at fixed traversal limits.
+
+#### Non-goals
+
+- New callee forms beyond those already supported by Phase 5.
+- Caller-specific parameter types or separate analysis per call context.
+- Alias, closure-capture, heap, object-property, or return-value propagation.
+- Treating unresolved calls as reachable graph edges.
+
+### Phase 7: Expand and persist the call graph — Planned
+
+#### Goal
+
+Replace the traversal tree implicit in `discoveredFrom` with an explicit graph. A graph node is a function identity; a graph edge is a concrete callsite with caller, source location, callee resolution status, and zero or more candidate targets. Traversal should consume this graph rather than being the only place call relationships exist.
+
+#### Resolution increments
+
+Implement and evaluate each increment independently, with fixtures and js-yaml deltas reported before proceeding:
+
+1. **Current direct calls as graph edges:** preserve every local named-function callsite, including repeated calls and calls to already visited functions.
+2. **Aliases and function-valued bindings:** resolve simple immutable identifier aliases and named function expressions/arrow functions without flow-sensitive assignment tracking.
+3. **Imports and module exports:** resolve relative CommonJS imports first, then ESM imports/exports under an explicit runtime condition. Never conflate `.d.ts` symbols with runtime implementations.
+4. **Static property calls:** resolve object-literal/module-namespace properties only when the target is unique and statically demonstrated.
+5. **Callbacks:** connect a function argument to a callee parameter only for explicit, modeled APIs or locally visible direct invocation; otherwise retain an unresolved callback relationship.
+6. **Methods and constructors:** add only after receiver and declaration identity semantics are defined for overloads, inheritance, and JavaScript prototype assignments.
+
+Dynamic property access, `eval`, runtime mutation, and genuinely polymorphic dispatch remain unresolved unless represented as explicit candidate sets. The graph must expose uncertainty rather than select a convenient declaration.
+
+#### Graph and storage contract
+
+- Stable function-node IDs derive from canonical runtime source identity and declaration span.
+- Stable callsite IDs derive from caller identity and original call-expression span.
+- Each callsite records its spelling, source location, resolution kind, candidate targets, and unresolved/ambiguous reason where applicable.
+- Recursion and mutual recursion are ordinary graph cycles, not errors. Traversal limits apply to expansion work, not graph truth already discovered.
+- SQLite graph tables reference function nodes and preserve all callsites, including unresolved ones. Analysis `edges` remain branch edges and must not be conflated with call-graph edges.
+- JSON and SQLite must represent the same nodes and callsites; terminal output may summarize them.
+
+#### Acceptance criteria
+
+- [ ] The graph records all supported callsites, not only the first parent that discovered a function.
+- [ ] Repeated callers, recursion, and mutual recursion preserve their edges while each function node remains unique.
+- [ ] Resolved, ambiguous, unsupported, and unresolved callsites are distinguishable in API, JSON, and SQLite output.
+- [ ] Traversal from the entry node is deterministic and produces the Phase 6 reachable function set.
+- [ ] Every new resolution form has positive, negative, ambiguity, and cycle tests.
+- [ ] js-yaml graph growth is measured after each increment: node count, resolved callsites, unresolved callsites, and analysis-result changes.
+
+### Phase 8: Evaluate contextual interprocedural analysis — Deferred
+
+Only after Phases 6 and 7 establish a trustworthy library result and call graph should analysis become call-context sensitive. Candidate experiments, in increasing complexity, are:
+
+1. specialize a callee parameter from a statically known direct-call argument;
+2. analyze distinct call contexts with memoization and explicit widening/budget limits;
+3. track a parameter copied into a local alias;
+4. track a parameter stored in an object field, as js-yaml does with parser state.
+
+Each experiment needs a concrete fixture, semantics for unions of call contexts, a termination budget, and an observed improvement over independent `T` analysis. Avoid building a general taint or abstract-interpretation engine by accident.
 
 ## Test Matrix
 
@@ -262,7 +367,9 @@ Maintain small source fixtures covering:
 - existing JavaScript JSDoc;
 - unsupported parameter and branch forms;
 - CommonJS re-export and direct-call discovery;
-- recursive calls and traversal limits.
+- recursive calls and traversal limits;
+- library jobs with repeated callees and partial function failures;
+- explicit callsites with repeated callers, ambiguity, and graph cycles.
 
 Every regression test should assert structured classifications and original source locations, not only formatted type strings.
 
@@ -284,6 +391,10 @@ Current coverage is split between:
 - **Behavior-changing instrumentation:** Prefer direct reference expressions and initially reject placements that require structural rewrites.
 - **Compiler-version coupling:** Stay on public APIs. Use `deps/TypeScript` to explain behavior, but do not import from its source tree or depend on internal `flowNode` structures.
 - **JavaScript module ambiguity:** Resolve the requested runtime condition explicitly rather than conflating declaration files, ESM bundles, and CommonJS sources.
+- **Graph completeness claims:** A graph is complete only relative to documented resolution rules. Preserve unresolved and ambiguous callsites so “not resolved” is never mistaken for “not called.”
+- **Identity drift:** Function and callsite IDs must use original runtime source locations and remain independent of virtual instrumentation offsets and traversal order.
+- **Failure amplification:** Library jobs must isolate per-function analysis failures instead of losing the entire reachable result.
+- **Database terminology:** Branch `edges` and call-graph edges are different entities and require distinct schemas and names.
 - **Scope explosion:** Keep branch-kind expansion, JavaScript rewriting, source discovery, and contextual interprocedural analysis as separate milestones.
 - **Limited `js-yaml` signal:** `loadDocuments` quickly copies `input` into state and branches on state properties. Parameter-only analysis may find little; report that outcome rather than broadening provenance tracking implicitly.
 
@@ -298,3 +409,16 @@ The prototype is complete when it can:
 5. run a focused automated test suite without modifying analyzed source files.
 
 Context-sensitive call analysis and parameter-to-object-property provenance are explicitly outside this initial definition of done.
+
+## Definition of Done for the Two Extensions
+
+The next implementation stage is complete when it can:
+
+1. accept a file/function or runtime package/export entry point and produce one resilient, deterministic library result;
+2. analyze each supported reachable function once while preserving unsupported, failed, unresolved, and truncated records;
+3. represent functions and every supported callsite as an explicit cyclic graph rather than only a discovery tree;
+4. persist library ownership, function nodes, callsites, and branch-analysis rows without conflating call and branch edges;
+5. show reproducible js-yaml node/callsite/analysis counts under fixed configuration; and
+6. retain all existing single-function, SQLite-edge, and V8-coverage behavior.
+
+Caller-specific type propagation is not required for these two extensions; it is the subject of the deferred contextual-analysis phase.
