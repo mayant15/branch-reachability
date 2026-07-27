@@ -90,6 +90,21 @@ Structured package results include export-resolution steps, complete per-functio
 npm run analyze -- --package js-yaml --export load --max-depth 1 --json
 ```
 
+## Library-wide analysis
+
+Execute a trusted CommonJS entry file, collect its package-owned JavaScript files
+from `require.cache`, and independently analyze every direct top-level named
+function declaration:
+
+```sh
+npm run analyze -- --library node_modules/js-yaml/index.js
+```
+
+Use `--json` for complete per-function results or `--library-root <directory>`
+to override the nearest-package root. This prototype executes the entry point
+without a sandbox and intentionally does not discover ESM, asynchronous loads,
+nested functions, arrows, methods, or function expressions.
+
 ## SQLite output
 
 Persist the same edge rows shown by `console.table` into an `edges` table. Re-running an analysis updates rows with the same location-derived `edge_id`.

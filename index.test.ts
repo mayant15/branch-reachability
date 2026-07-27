@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import {mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs"
+import {mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os"
 import path from "node:path"
 import {spawnSync} from "node:child_process"
@@ -10,6 +10,7 @@ import ts from "typescript"
 import {importV8Coverage} from "./coverage.ts"
 import {analyzePackageExport, formatPackageAnalysisResult} from "./discovery.ts"
 import {analyzeFile, analyzeSource, getAnalysisTableRows} from "./index.ts"
+import {analyzeLibrary, discoverLibraryFiles, inventoryTopLevelFunctions} from "./library.ts"
 import {writeAnalysesToSqlite} from "./sqlite-output.ts"
 
 function analyze(sourceText: string, typeText = "string") {
@@ -644,6 +645,111 @@ test("CLI rejects package-only options in file mode", () => {
 
   assert.equal(execution.status, 1)
   assert.match(execution.stderr, /require --package/)
+})
+
+test("library mode discovers CommonJS files and analyzes top-level functions", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-library-"))
+  try {
+    const dependencyDirectory = path.join(directory, "node_modules/dependency")
+    mkdirSync(dependencyDirectory, {recursive: true})
+    writeFileSync(path.join(directory, "package.json"), JSON.stringify({name: "fixture"}))
+    writeFileSync(path.join(directory, "data.json"), JSON.stringify({enabled: true}))
+    writeFileSync(path.join(dependencyDirectory, "package.json"), JSON.stringify({
+      name: "dependency",
+      main: "index.js",
+    }))
+    writeFileSync(path.join(dependencyDirectory, "index.js"), `
+function dependencyFunction(value) {
+  return value
+}
+module.exports = dependencyFunction
+`)
+    writeFileSync(path.join(directory, "dependency.js"), `
+function helper(value) {
+  if (typeof value === "string") return value
+  return null
+}
+function outer(value) {
+  function nested(value) {
+    if (typeof value === "number") return value
+  }
+  return nested(value)
+}
+module.exports = {helper, outer}
+`)
+    const entryFile = path.join(directory, "index.js")
+    writeFileSync(entryFile, `
+console.log("fixture loaded")
+const dependencyName = "./dependency.js"
+require(dependencyName)
+require("./data.json")
+require("dependency")
+function entryPoint(value) {
+  if (typeof value === "number") return value
+  return null
+}
+const ignoredArrow = value => value
+module.exports = entryPoint
+`)
+
+    const result = analyzeLibrary({entryFile})
+    assert.equal(result.discovery.status, "complete")
+    assert.match(result.discovery.stdout, /fixture loaded/)
+    assert.deepEqual(
+      result.files.map(file => path.basename(file.fileName)),
+      ["index.js", "dependency.js"],
+    )
+    assert.deepEqual(
+      result.files.flatMap(file => file.functions.map(fn => fn.functionName)),
+      ["entryPoint", "helper", "outer"],
+    )
+    assert.equal(result.discovery.excludedFiles.length, 2)
+    assert.deepEqual(result.summary, {
+      files: 2,
+      excludedFiles: 2,
+      functions: 3,
+      analyzedFunctions: 3,
+      failedFunctions: 0,
+      branches: 2,
+      unreachableEdges: 2,
+      diagnosticOccurrences: 0,
+      unsupported: 0,
+    })
+
+    const execution = spawnSync(
+      process.execPath,
+      ["cli.ts", "--library", entryFile, "--json"],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+    assert.equal(execution.status, 0, execution.stderr)
+    const cliResult = JSON.parse(execution.stdout) as {summary: {functions: number}}
+    assert.equal(cliResult.summary.functions, 3)
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("library discovery inventories the loaded js-yaml package", () => {
+  const discovered = discoverLibraryFiles("node_modules/js-yaml/index.js")
+  assert.equal(discovered.discovery.status, "complete")
+  assert.equal(discovered.discovery.files.length, 25)
+  assert.equal(discovered.discovery.excludedFiles.length, 0)
+
+  const inventories = discovered.discovery.files.map(fileName => ({
+    fileName,
+    functions: inventoryTopLevelFunctions(fileName),
+  }))
+  assert.equal(inventories.reduce((count, file) => count + file.functions.length, 0), 113)
+  assert.deepEqual(
+    inventories.find(file => file.fileName.endsWith("/index.js"))?.functions
+      .map(fn => fn.functionName),
+    ["renamed"],
+  )
+  assert.equal(
+    inventories.find(file => file.fileName.endsWith("/lib/loader.js"))?.functions
+      .some(fn => fn.functionName === "loadDocuments"),
+    true,
+  )
 })
 
 test("creates deterministic rows for console.table", () => {

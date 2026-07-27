@@ -6,13 +6,13 @@ Build a TypeScript compiler-API analysis that answers this counterfactual questi
 
 > If every input to a function had a configured type `T`, which branch edges would TypeScript's control-flow narrowing consider impossible?
 
-The completed prototype answers this for one function at a time and has a bounded CommonJS/direct-call discovery experiment. The next version will make a whole reachable library the unit of analysis, then turn the existing traversal experiment into an explicit and progressively broader call graph. `js-yaml`'s CommonJS `load` implementation remains the integration target.
+The completed prototype answers this for one function at a time and across a runtime-discovered CommonJS library. The next version will turn the resulting function inventory into an explicit and progressively broader call graph. `js-yaml` remains the integration target.
 
 This is an analysis of TypeScript's model, not proof that code is unreachable at runtime. Results must always retain compiler diagnostics and identify unsupported constructs.
 
 ## Current Status
 
-**Phases 1 through 5 are complete, so the initial prototype definition of done is satisfied.** Work now moves from a single-function engine and a narrow discovery experiment to library-level analysis and call-graph expansion.
+**Phases 1 through 6 are complete.** The project now has a single-function engine, runtime-discovered library analysis, and an earlier narrow call-discovery experiment. Work moves next to explicit call-graph expansion.
 
 ### Implemented baseline
 
@@ -25,13 +25,15 @@ The implementation lives in `index.ts` and exposes:
 
 `discovery.ts` exposes `analyzePackageExport` and `formatPackageAnalysisResult` for CommonJS package-export resolution and bounded direct-call traversal.
 
+`library.ts` executes a trusted CommonJS entry in a child process, discovers package-owned files through `require.cache`, inventories direct top-level named function declarations, and independently analyzes each function with failure isolation.
+
 The `cli.ts` entry point is available through `npm run analyze`. File mode supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`. Package mode accepts `--package`, `--export`, `--max-depth`, and `--max-functions`. Both modes accept `--sql <path>` to transactionally upsert edge rows into SQLite.
 
 The `coverage.ts` entry point is available through `npm run coverage`. It imports raw V8 coverage reports into an edge database, matching only true/false edges by exact or smallest-containing original-source spans and summing unambiguous counts across reports.
 
 The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Forty-two tests in `index.test.ts` cover Phases 1 through 5, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
+Forty-four tests in `index.test.ts` cover Phases 1 through 6, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -41,17 +43,17 @@ The `tests/` directory contains manually runnable end-to-end CLI fixtures for ba
 - Package mode is a prototype specialized to Node's `require` condition, a small set of CommonJS forwarding assignments, and checker-resolved direct calls to local named function declarations.
 - Discovery returns a traversal list with one `discoveredFrom` parent. It does not retain every callsite or represent a reusable many-to-many call graph.
 - Function expressions, arrow functions, methods, constructors, callbacks, imported callees, most property calls, ESM exports, and dynamic dispatch are not resolved as graph nodes.
-- A failure to analyze one discovered function is not yet modeled as a recoverable per-function library result.
+- Library mode isolates per-file and per-function failures so successful sibling analyses are retained.
 - SQLite stores analysis edges, but not library identities, function nodes, callsites, unresolved-call records, or traversal metadata.
 - V8 coverage is post-processed against original JavaScript offsets. Transpiled sources still require source-map remapping before import.
 
 ### Roadmap at a glance
 
-1. **Phase 6 — Library-level analysis:** make an entry point plus its complete *supported reachable function set* one analysis job. Preserve per-function results and failures, and emit one coherent report/database.
+1. **Phase 6 — Library-level analysis (complete):** execute a CommonJS entry file to discover its package-owned file closure, enumerate every direct top-level named function declaration, and analyze each independently in one job.
 2. **Phase 7 — Call-graph expansion:** promote discovery to explicit function and callsite records, broaden static callee resolution in measured steps, and retain unresolved or ambiguous edges rather than guessing.
 3. **Later contextual analysis:** only after the graph is reliable, evaluate caller-to-callee type specialization, aliases, and object-property provenance as separate experiments.
 
-The boundary between Phases 6 and 7 is deliberate. Phase 6 uses the currently supported traversal to establish the library-level contract. Phase 7 improves which functions and relationships that contract can represent. Neither phase should silently introduce interprocedural type propagation.
+The boundary between Phases 6 and 7 is deliberate. Phase 6 discovers **files by runtime loading** and **functions by syntax**, without deciding which functions call one another. Phase 7 adds those relationships and uses them for graph reachability. Neither phase should silently introduce interprocedural type propagation.
 
 ## Compiler API Strategy
 
@@ -256,59 +258,159 @@ Do not rely on the imported `load` symbol in this repository's `index.ts` to fin
 - across those 13 functions, `composeNode` contains one newly unreachable edge at line 1430: the true edge of `CONTEXT_FLOW_IN === nodeContext || CONTEXT_FLOW_OUT === nodeContext` narrows configured `nodeContext: string` to `never`;
 - package resolution uses Node's actual `require` resolver. The supported CommonJS assignment forms are inspected statically; executing package code remains an available future fallback for more dynamic export patterns.
 
-### Phase 6: Make the library the unit of analysis — Next
+### Phase 6: Make the library the unit of analysis — Complete
 
 #### Goal
 
-Given one explicit runtime entry point, analyze every function reachable through the **currently supported** discovery rules and return a single durable library result. This phase productizes orchestration; it does not broaden callee resolution or propagate types between functions.
+Given one JavaScript entry file, usually a package's `index.js`, discover the JavaScript files left in `require.cache` after evaluating that entry point. For every discovered package-owned file, enumerate and independently analyze all direct top-level named function declarations. Nested functions are deliberately excluded. This creates a useful prototype inventory that Phase 7 can connect into a call graph.
 
-Supported entry-point forms should share one internal target model:
+The initial CLI shape is:
 
-- package plus export under an explicit runtime condition, initially `require`;
-- source file plus named function and optional declaration position.
+```sh
+npm run analyze -- --library <entry.js> [--library-root <directory>] [options]
+```
 
-The result must preserve:
+`--type`, `--json`, and eventually `--sql` retain their existing meanings. Existing `<file> <function>` and package/export modes remain compatible during migration.
 
-- library/job identity and entry-point resolution steps;
-- a stable function identity based on canonical source file plus declaration position;
-- one independent `AnalysisResult` per function;
-- depth and discovery provenance;
-- unresolved calls, traversal truncation, unsupported functions, and per-function failures;
-- deterministic ordering independent of filesystem or checker iteration order.
+#### Definitions and scope
+
+- **Runtime-discovered file:** a `.js` or `.cjs` file present in `require.cache` after requiring the entry file, including the entry itself. Synchronous dynamic `require(expression)` is included because discovery executes the module rather than parsing require strings.
+- **Library root:** `--library-root` when supplied; otherwise the nearest ancestor containing `package.json`; otherwise the entry file's directory.
+- **Package-owned file:** a discovered JavaScript file whose canonical path is inside the selected root and not inside a nested `node_modules` directory below that root. Other cached files are recorded as exclusions and not analyzed by default.
+- **Top-level function:** a named, body-bearing `FunctionDeclaration` that appears directly in `SourceFile.statements`. Function expressions, arrows, methods, callbacks, declarations inside blocks, and functions nested in another function are outside this prototype increment.
+- **Independent analysis:** every selected function has all supported parameters overridden with the configured `T`. No caller argument type, call reachability, or call context affects its result.
+
+This deliberately means that Phase 6 may analyze top-level helper functions that are loaded but never called. Runtime module loading defines the file boundary; call-graph reachability begins only in Phase 7.
+
+#### Runtime discovery design
+
+Discovery must execute outside the analyzer process:
+
+```diagram
+┌──────────────┐   spawn child    ┌──────────────────────┐
+│ analyze CLI  │─────────────────▶│ CommonJS probe child │
+└──────┬───────┘                  └──────────┬───────────┘
+       │                                     │ require(entry.js)
+       │                                     │ inspect require.cache
+       │      structured file manifest       │
+       ◀─────────────────────────────────────┘
+       │
+       ▼
+┌────────────────┐   parse files   ┌──────────────────────┐
+│ library planner│────────────────▶│ top-level declarations│
+└──────┬─────────┘                 └──────────────────────┘
+       │ analyze each function by name + position
+       ▼
+┌────────────────┐
+│ AnalysisResult[]│
+└────────────────┘
+```
+
+1. Spawn a small Node child without a shell. Keep entry stdout/stderr separate and reserve fd 3 for one JSON discovery payload so library logging cannot corrupt it.
+2. In the child, snapshot `require.cache`, synchronously `require(entryFile)`, catch an ordinary thrown error, then return newly cached filenames plus the entry filename. Dynamic CommonJS requires work naturally without a loader hook.
+3. Use `spawnSync` with a timeout and bounded output. A missing or malformed payload is a discovery failure.
+4. Canonicalize discovered files with `realpath`, deduplicate them, retain `.js`/`.cjs` files inside the library root, and record other cached files as exclusions.
+5. Analyze the files returned even when `require(entryFile)` throws an ordinary catchable error, while marking discovery incomplete and returning a nonzero CLI status.
+
+This is **dynamic CommonJS discovery**, not support for JavaScript `import()` syntax. ESM has no `require.cache` equivalent and needs Node loader hooks plus an explicit async-settling policy; defer it until the CommonJS contract is stable.
+
+Executing an entry point can run arbitrary code, perform I/O, or mutate external state. Child-process isolation protects analyzer state but is not a security sandbox. The CLI and documentation must state that users should only execute trusted libraries. Do not attempt to fake network, filesystem, clock, or environment APIs in this phase.
+
+#### Package ownership
+
+Resolve and `realpath` the entry and root before spawning. The root must be an existing directory containing the entry. Ownership is a straightforward path-containment check; a `node_modules` segment below the selected root marks a dependency exclusion. The selected root itself remains valid without `package.json`, which keeps fixtures simple.
+
+#### Function inventory and analysis design
+
+1. Parse each included file once with TypeScript using its actual JavaScript script kind.
+2. Inspect `sourceFile.statements` only. Collect named, body-bearing `FunctionDeclaration` nodes in source order; nested declarations are never visited.
+3. Identify each function by canonical file plus declaration start offset. Pass its name and `functionPosition` to the existing `analyzeFile` API, avoiding a target-selector rewrite in this phase.
+4. Record the declaration's complete original span. Do not use names alone as identity.
+5. Analyze files in canonical manifest order and functions in source order. Sort only where the runtime loader does not provide an order. Output must be deterministic for a fixed execution path.
+6. Catch failures around each function. Store either a successful `AnalysisResult` or a structured failure with function identity and message; continue with sibling functions and files.
+7. Treat an `AnalysisResult` containing unsupported parameters/branches or diagnostics as a successful analysis result with findings, not as an orchestration failure.
+8. Keep a single discovery manifest and parse inventory per job. Continue using the analyzer's fresh virtual `Program` per function until profiling demonstrates that program construction is the bottleneck and a shared edit strategy is safe.
+
+Use one fixed standalone JavaScript compiler-option policy for the whole job with `tsconfig: false`, matching package mode. Reject `--project` and `--no-project` in library mode until whole-job project semantics are designed. Per-function diagnostics may repeat source-file diagnostics in this phase; label summary counts as diagnostic occurrences rather than unique diagnostics.
+
+#### Result contract
+
+Introduce a `LibraryAnalysisResult` with these conceptual records:
+
+- entry file, library root, configured `T`, discovery method, and completion status;
+- ordered included files and excluded dependency loads;
+- discovery warnings/error, timeout, and captured process output;
+- per-file parse status;
+- stable function ID, name, declaration span, and either `AnalysisResult` or analysis failure;
+- summary counts derived from the records: files, functions, branches, unreachable edges, diagnostics, unsupported findings, and failures.
+
+Do not put call depth, caller identity, or `discoveredFrom` on Phase 6 function records. Those are graph concepts and would incorrectly imply source-level call discovery.
+
+For deterministic output, preserve `require.cache` insertion order and function source order, and store structured error messages without stacks. Captured stdout/stderr are bounded but inherently nondeterministic, so omit them from default JSON. Function IDs are stable only for fixed canonical source content; do not claim portability across source edits or machines.
 
 #### Implementation sequence
 
-1. Extract entry resolution, traversal, and per-function analysis orchestration from the js-yaml-specific package path into a general library-analysis API.
-2. Define a structured result in which successful, unsupported, failed, unresolved, and truncated outcomes cannot be confused.
-3. Keep one source-discovery `Program` per library job; continue creating the analyzer's fresh virtual `Program` per function until measurements justify a shared counterfactual program.
-4. Make traversal resilient: one unsupported or failed function must be recorded without discarding successful sibling results.
-5. Add deterministic library-level human and JSON output, with summaries derived from structured records rather than parsed text.
-6. Extend SQLite output with library/function ownership while retaining existing `edges` compatibility and baseline-parent invariants. Design the schema before migration; do not overload `edge_id` to encode graph identity.
-7. Establish fixture libraries that exercise multiple files, repeated callees, recursion, unsupported functions, and partial failures before relying on js-yaml alone.
+1. [x] Add a small fixture library and implement the child `require.cache` discovery helper plus root filtering.
+2. [x] Implement direct top-level function-declaration inventory and library orchestration using the existing analyzer.
+3. [x] Add `--library` and `--library-root`, deterministic human/JSON summaries, and failure-isolation tests.
+4. [x] Run js-yaml's `index.js`, inspect the result, then freeze broad discovered-file/function counts as regression expectations.
+5. Library-aware SQLite ownership is deferred. The prototype's in-memory, human, and JSON results are sufficient for Phase 6; existing single-function/package `edges` persistence remains unchanged.
+
+Library mode conflicts are explicit: `--library` rejects positional arguments, package/export and traversal options, and project options. Reject `--sql` until the persistence slice exists rather than silently ignoring it. Incomplete discovery or orchestration failure prints the structured result and exits nonzero; diagnostics and unsupported analysis findings remain successful findings.
 
 #### Acceptance criteria
 
-- [ ] One command can analyze a file/function or package/export entry point as a library job.
-- [ ] Every function reachable under the current supported call rules is analyzed at most once by stable identity.
-- [ ] Multiple callers of one function do not duplicate its intraprocedural analysis.
-- [ ] Unsupported or failed functions are retained as explicit records and do not abort unrelated reachable analysis.
-- [ ] Limits produce deterministic truncation records and never silently omit functions.
-- [ ] Human, JSON, and SQLite outputs agree on function, branch, diagnostic, unsupported, unresolved, and truncated counts.
-- [ ] Existing single-function CLI/API behavior remains compatible.
-- [ ] js-yaml `load` produces a stable library-level regression result at fixed traversal limits.
+- [x] One command accepts a CommonJS JavaScript entry file and emits one library result.
+- [x] Dynamic CommonJS requires are captured using Node's runtime resolution behavior.
+- [x] Included files belong to the selected library root; cached non-JavaScript assets and dependency-owned files are explicitly excluded.
+- [x] Every direct top-level named function declaration in every included file is enumerated and analyzed exactly once by stable identity.
+- [x] Nested functions are not inventoried or analyzed.
+- [x] Entry logging cannot corrupt the child-to-parent discovery protocol.
+- [x] One unsupported or failed function does not abort unrelated functions.
+- [x] Human and JSON outputs agree on all summary counts.
+- [x] Existing single-function CLI/API behavior remains compatible.
+- [x] js-yaml produces a stable discovered-file and top-level-function inventory from its CommonJS entry file.
+
+Current js-yaml result with `T = string`:
+
+- 25 runtime-discovered package files;
+- 113 direct top-level function declarations, all analyzed without orchestration failure;
+- 379 supported branches and 9 parameter-based unreachable edges;
+- 983 diagnostic occurrences, largely because whole-file diagnostics repeat for each independently analyzed function;
+- no excluded files and no unsupported findings.
 
 #### Non-goals
 
-- New callee forms beyond those already supported by Phase 5.
+- Determining whether an inventoried function is callable from the entry export; that begins in Phase 7.
+- Static require-string discovery as a fallback for modules that cannot safely execute.
+- ESM and JavaScript `import()` discovery.
+- Analyzing dependency-owned package files by default.
+- Function expressions, arrows, methods, constructors, accessors, callbacks, and functions nested inside another function.
 - Caller-specific parameter types or separate analysis per call context.
 - Alias, closure-capture, heap, object-property, or return-value propagation.
-- Treating unresolved calls as reachable graph edges.
+
+#### Prototype limitations
+
+- Entry execution is not sandboxed and must only be used with trusted code.
+- Discovery is CommonJS-only. ESM, JavaScript `import()`, and requires scheduled after synchronous entry evaluation are not observed.
+- Builtin module loads do not appear in `require.cache` and are not reported in the manifest.
+- `require.cache` misses modules that remove themselves, modules that fail before remaining cached, and loader activity hidden by unusual runtime behavior.
+- An entry that calls `process.exit`, crashes, or times out may produce no partial manifest; it is reported as discovery failure.
+- Discovery-process failures use one coarse `failed` status with an error message rather than distinct timeout, crash, and malformed-protocol variants.
+- Discovery depends on runtime inputs and environment variables. Conditional requires may produce different file sets across runs.
+- Root ownership uses simple containment and nested-`node_modules` filtering; nested package boundaries outside that convention may be included.
+- Only direct source-file named function declarations are analyzed. Other top-level function-like forms are deferred rather than partially supported.
+- Each function gets a fresh compiler program, and source-file diagnostics may be repeated across sibling function results. This is acceptable until profiling or output use shows otherwise.
+- Dependency packages are excluded by default, and there is no recursive multi-package library model.
+- JSON contains canonical absolute paths and captured process output, so byte-for-byte output is not portable or guaranteed deterministic across environments.
+- Library/file/function ownership is not persisted to SQLite; library-aware persistence is deferred until a concrete consumer needs it.
+- There is no call graph, export reachability, caller-specific type propagation, source-map remapping, or asynchronous module-settling policy in Phase 6.
 
 ### Phase 7: Expand and persist the call graph — Planned
 
 #### Goal
 
-Replace the traversal tree implicit in `discoveredFrom` with an explicit graph. A graph node is a function identity; a graph edge is a concrete callsite with caller, source location, callee resolution status, and zero or more candidate targets. Traversal should consume this graph rather than being the only place call relationships exist.
+Connect the complete Phase 6 function inventory with an explicit graph. A graph node is an inventoried function identity; a graph edge is a concrete callsite with caller, source location, callee resolution status, and zero or more candidate targets. Initially retain disconnected functions rather than assuming that absence of a resolved path proves runtime unreachability. Once graph-root semantics are defined, traversal should consume this graph rather than being the only place call relationships exist.
 
 #### Resolution increments
 
@@ -337,7 +439,7 @@ Dynamic property access, `eval`, runtime mutation, and genuinely polymorphic dis
 - [ ] The graph records all supported callsites, not only the first parent that discovered a function.
 - [ ] Repeated callers, recursion, and mutual recursion preserve their edges while each function node remains unique.
 - [ ] Resolved, ambiguous, unsupported, and unresolved callsites are distinguishable in API, JSON, and SQLite output.
-- [ ] Traversal from the entry node is deterministic and produces the Phase 6 reachable function set.
+- [ ] Graph construction is deterministic and never invents nodes outside or silently drops nodes from the Phase 6 inventory.
 - [ ] Every new resolution form has positive, negative, ambiguity, and cycle tests.
 - [ ] js-yaml graph growth is measured after each increment: node count, resolved callsites, unresolved callsites, and analysis-result changes.
 
@@ -375,7 +477,7 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 42 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, `console.table` formatting, SQLite persistence, V8 coverage import, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
+- `index.test.ts`: 44 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, library discovery/inventory, `console.table` formatting, SQLite persistence, V8 coverage import, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
 - `coverage/v8/js-yaml`: five committed raw V8 reports exercised by the coverage-import regression test;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
@@ -414,9 +516,9 @@ Context-sensitive call analysis and parameter-to-object-property provenance are 
 
 The next implementation stage is complete when it can:
 
-1. accept a file/function or runtime package/export entry point and produce one resilient, deterministic library result;
-2. analyze each supported reachable function once while preserving unsupported, failed, unresolved, and truncated records;
-3. represent functions and every supported callsite as an explicit cyclic graph rather than only a discovery tree;
+1. accept a CommonJS JavaScript entry file and produce one resilient, deterministic library result from its runtime-discovered package-owned files;
+2. enumerate and independently analyze every direct top-level named function declaration once while preserving exclusions and per-function failures;
+3. represent inventoried functions and every supported callsite as an explicit cyclic graph rather than only a discovery tree;
 4. persist library ownership, function nodes, callsites, and branch-analysis rows without conflating call and branch edges;
 5. show reproducible js-yaml node/callsite/analysis counts under fixed configuration; and
 6. retain all existing single-function, SQLite-edge, and V8-coverage behavior.
