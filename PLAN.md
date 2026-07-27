@@ -50,8 +50,9 @@ The `tests/` directory contains manually runnable end-to-end CLI fixtures for ba
 ### Roadmap at a glance
 
 1. **Phase 6 — Library-level analysis (complete):** execute a CommonJS entry file to discover its package-owned file closure, enumerate every direct top-level named function declaration, and analyze each independently in one job.
-2. **Phase 7 — Call-graph expansion:** promote discovery to explicit function and callsite records, broaden static callee resolution in measured steps, and retain unresolved or ambiguous edges rather than guessing.
-3. **Later contextual analysis:** only after the graph is reliable, evaluate caller-to-callee type specialization, aliases, and object-property provenance as separate experiments.
+2. **Input-type extension — Parameterized function analysis:** make the core analysis consume a function identity plus an ordered parameter-type vector. `--type` produces a uniform vector, `--decl <path>` produces the exact per-function vector declared by TypeScript, and no flag retains the `string` fallback.
+3. **Phase 7 — Call-graph expansion:** promote discovery to explicit function and callsite records, broaden static callee resolution in measured steps, and retain unresolved or ambiguous edges rather than guessing.
+4. **Later contextual analysis:** only after the graph is reliable, evaluate caller-to-callee type specialization, aliases, and object-property provenance as separate experiments.
 
 The boundary between Phases 6 and 7 is deliberate. Phase 6 discovers **files by runtime loading** and **functions by syntax**, without deciding which functions call one another. Phase 7 adds those relationships and uses them for graph reachability. Neither phase should silently introduce interprocedural type propagation.
 
@@ -406,6 +407,230 @@ Current js-yaml result with `T = string`:
 - Library/file/function ownership is not persisted to SQLite; library-aware persistence is deferred until a concrete consumer needs it.
 - There is no call graph, export reachability, caller-specific type propagation, source-map remapping, or asynchronous module-settling policy in Phase 6.
 
+### Input-type extension: Load parameter types from an explicit declaration file — Planned
+
+#### Goal and CLI contract
+
+Support two library-wide analysis modes over the same function inventory:
+
+1. **Uniform counterfactual mode:** every parameter of every function receives one hardcoded type such as `string` or `string | number`.
+2. **TypeScript-defined mode:** parameters of functions matched in the supplied declaration file receive those declared types; unmatched private functions retain the annotations, JSDoc, or inferred types TypeScript assigns in their implementation source. Different functions and parameters may therefore have different types.
+
+Both modes must call the same core analysis, parameterized by a function identity and an ordered parameter-type vector. The CLI exposes TypeScript-defined mode through a user-supplied `.d.ts` file:
+
+```sh
+npm run analyze -- --decl <library.d.ts> <file> <function>
+npm run analyze -- --library <entry.js> --decl <library.d.ts>
+npm run analyze -- --package <name> --export <name> --decl <library.d.ts>
+```
+
+The input-type precedence is explicit:
+
+1. `--type <type>` applies that one type to every supported parameter, preserving current behavior.
+2. `--decl <path>` derives each matched parameter type by position from the declaration and preserves source-defined types for unmatched private functions.
+3. With neither flag, the analyzer applies `string`, preserving the current default.
+
+`--type` and `--decl` are mutually exclusive. `--decl` must name a readable `.d.ts` file; do not implicitly search package metadata, `node_modules/@types`, or a nearby declaration file in this increment. This keeps declaration selection deterministic and makes an incorrect declaration source visible at the command line.
+
+This is still intraprocedural analysis. Declaration-derived parameter types do not imply that the declaration file identifies runtime reachability, supplies a call graph, or proves that the JavaScript implementation conforms to the declarations.
+
+Declared mode must analyze the complete function inventory. Public package declarations commonly describe only exported functions, so a missing declaration match means the function is private and should retain the parameter types from its implementation source. Do not replace all private parameters with `any`: preserve explicit TypeScript annotations and JavaScript JSDoc, and let the checker retain its ordinary inferred type when no annotation exists. A parameter is `any` only when TypeScript itself resolves it to `any`; record that as an `inferred-any` source so consumers can distinguish missing type information from an intentional declared `any`.
+
+#### Declaration matching rules
+
+Parse the supplied declaration file in its own TypeScript `Program` and use the checker rather than extracting type text with regular expressions. For an analyzed runtime function named `f`:
+
+1. Find exported or ambient, bodyless function declarations named `f` in the declaration file's top-level module/source scope. Class and interface methods, constructors, callable variables, namespace members, and re-exports are deferred.
+2. If there is no match, classify the function as private/unmatched and use its implementation-source parameter types. If there is more than one match or an overload set, report ambiguity explicitly rather than selecting one by source order or silently treating the function as private.
+3. Match source parameters to declaration parameters by position. Names need not agree, but arity must agree exactly in the first increment.
+4. Reject declaration rest parameters. Preserve optional declaration semantics: the configured type for an optional parameter includes `undefined`, as represented by TypeScript for that parameter position.
+5. Continue to enforce the runtime source restrictions already required for safe rewriting: every implementation parameter must be a simple, non-rest identifier without a default initializer or other unsupported modifier.
+
+For matched declarations, ambiguity, incompatible arity, or unsupported declaration syntax is a focused function failure; do not fall back to implementation types after finding evidence that the declaration intends to describe that function. In library mode this remains an isolated per-function failure while siblings continue. A clean no-match is not a failure and never falls back to the uniform `string` default.
+
+The deliberately narrow top-level-name rule treats declarations represented only through namespace members, methods, callable variables, or re-exports as unmatched in the first increment. Result metadata must identify whether each parameter type came from the supplied declaration, an implementation annotation/JSDoc, checker inference, or checker-inferred `any`; this makes narrow matching visible without inventing declaration relationships.
+
+#### Type injection and compiler integration
+
+Refactor the source planner's input from one `typeText` string into one configured type expression per parameter. Uniform `--type` mode repeats its expression for every parameter; declaration mode supplies a distinct expression for each position. Branch planning, probes, classification, and original-location mapping remain unchanged.
+
+For an unmatched private function, do not add or replace parameter annotations. Instrument only the probes and let the fresh virtual program check the original TypeScript annotation, JavaScript JSDoc, or inferred parameter type. Read and record the resulting parameter types from that same program. This avoids serializing checker types whose aliases may not be expressible in another scope and ensures an unannotated parameter becomes `any` only under the compiler options that already make it `any`.
+
+Declaration types can reference aliases, interfaces, classes, imports, and qualified names that are not in scope in the implementation file. Therefore, do not copy only the declaration parameter's printed text into JavaScript or TypeScript. Instead:
+
+1. Include the explicit declaration file in the virtual analysis program and preserve normal module resolution for any declarations it imports.
+2. Generate a stable type query for each parameter that refers back to the matched declaration, conceptually `Parameters<typeof import("<declaration module>").f>[N]` for exported declarations. Use an equivalent direct `typeof f` query for ambient-script declarations.
+3. Render that query in a form valid for both TypeScript annotations and JavaScript inline JSDoc, then reparse the edited implementation as today.
+4. Query the generated parameter node once before branch classification and verify that its checker type is not unresolved `any` because of a generated-name or module-resolution error. Keep all ordinary declaration and counterfactual diagnostics in the result.
+5. Keep declaration-file text and generated import references virtual/read-only; never edit the supplied `.d.ts` or implementation source.
+
+Before implementation, validate the exact import-type spelling under the repository's NodeNext settings for absolute declaration paths and `.d.ts` extensions. Prefer a relative module specifier accepted by TypeScript over enabling broad compiler options solely to permit generated imports. Ambient-script declarations need a separate path because they are global rather than module exports.
+
+Overload handling is intentionally rejected at first. `Parameters<typeof f>` observes only one effective overload signature and would silently discard the others; accepting overloads requires a separately defined policy such as one analysis per signature or a position-wise union.
+
+#### API and result contract
+
+Make the lowest analysis layer accept a resolved context:
+
+```text
+function identity + [parameter type 0, parameter type 1, ...]
+```
+
+Source instrumentation and branch classification must depend only on that resolved context, not on whether the types originated from a CLI literal, a declaration file, or eventually a callsite. Keep strategy resolution outside the source planner:
+
+- uniform mode repeats one configured type for the function's arity;
+- declaration mode resolves a matched signature into one override type per parameter, or uses source-preserved parameter entries for an unmatched private function;
+- future call-graph mode resolves each argument's flow-sensitive type at a callsite into one type per callee parameter.
+
+At the job boundary, represent the configured input as a discriminated strategy instead of overloading an optional string:
+
+- `{kind: "uniform", typeText: string, origin: "explicit" | "default"}`; or
+- `{kind: "declaration", fileName: string}` at the job boundary, resolved to a declaration identity and per-parameter type expressions for each function.
+
+The public programmatic APIs should reject both strategies being supplied together, matching the CLI. Keep the existing `typeText` option temporarily as the uniform-strategy shorthand so current callers do not require an unrelated migration.
+
+Give each resolved analysis context a deterministic identity derived from the stable function ID and ordered parameter-type identities after checking. The first increment may execute only one context per function, but result ownership and memoization must not assume that invariant. This allows later call-graph expansion to analyze the same callee under distinct callsite-derived type vectors without duplicating planner logic or conflating the results.
+
+`AnalysisResult.typeText` can no longer accurately describe all parameter inputs. Add structured input metadata containing the strategy, canonical declaration path and matched declaration location when applicable, plus each parameter's configured type string and type source. Retain `typeText` during a compatibility window for uniform results only; TypeScript-defined consumers must use the structured field. Human output should print either `T = <type>` or a per-function TypeScript-defined summary that distinguishes declaration-backed and source-preserved parameters.
+
+Do not collapse declaration-backed types into one SQLite `type_text` value. Existing single-type persistence may reject declaration mode until its schema has per-parameter input metadata, rather than storing a misleading sentinel. Library mode already rejects `--sql`, so this initially affects only file and package modes.
+
+#### Implementation checklist
+
+Complete these groups in order. Keep uniform mode green after each group so the refactor is behavior-preserving before declaration behavior is added.
+
+##### 1. Freeze the existing uniform contract
+
+- [ ] Add or tighten API tests proving omitted `typeText` resolves to `string` for TypeScript and JavaScript.
+- [ ] Add a CLI regression test for `--type 'string | number'` in file mode.
+- [ ] Add a library regression assertion that one uniform type is applied to every supported parameter of every inventoried function.
+- [ ] Record the current human/JSON shape and SQLite `type_text` behavior that must remain compatible in uniform mode.
+
+##### 2. Introduce input strategies and resolved contexts in `index.ts`
+
+- [ ] Define a job-level input strategy for uniform and declaration modes; retain `typeText` as the backward-compatible uniform shorthand.
+- [ ] Define an ordered resolved parameter input with an override expression or a source-preserved marker.
+- [ ] Define parameter type-source metadata: `uniform-default`, `uniform-explicit`, `declaration`, `source-annotation`, `source-jsdoc`, `inferred`, and `inferred-any`.
+- [ ] Define a resolved analysis context containing stable function identity and ordered parameter inputs.
+- [ ] Validate that the resolved parameter vector length equals the implementation function arity before planning edits.
+- [ ] Refactor `planParameterEdits` to consume the vector: inject override expressions and leave source-preserved parameters untouched.
+- [ ] Keep all current unsupported implementation-parameter checks unchanged in both strategies.
+- [ ] Derive the checked parameter type strings and type-source metadata from the fresh virtual program.
+- [ ] Derive a deterministic context ID from the stable function ID plus the ordered checked parameter-type identities.
+- [ ] Adapt uniform mode to build a repeated override vector and prove existing branch classifications and diagnostics are unchanged.
+
+##### 3. Implement explicit declaration loading and matching
+
+- [ ] Add a declaration resolver that canonicalizes the supplied path and requires a readable `.d.ts` file.
+- [ ] Parse the declaration and return its syntactic/configuration diagnostics before analyzing functions.
+- [ ] Build an index of supported top-level exported or ambient bodyless function declarations by name.
+- [ ] Distinguish no match, one match, overload/multiple matches, and unsupported matched declaration forms.
+- [ ] Treat no match as a private function whose complete parameter vector is source-preserved.
+- [ ] For one match, validate positional arity and reject declaration rest parameters.
+- [ ] Preserve optional declaration parameter semantics, including `undefined`.
+- [ ] Treat an ambiguous or incompatible match as a focused function failure; never reinterpret it as private and never fall back to `string`.
+- [ ] Store canonical declaration file, declaration span, and matched function name in the resolved context.
+
+##### 4. Make declaration type references resolvable
+
+- [ ] Include the explicit declaration file and its imported declarations in the virtual analysis program.
+- [ ] Validate a relative import-type spelling under NodeNext for module `.d.ts` files without enabling unrelated compiler options.
+- [ ] Generate a per-position exported declaration query equivalent to `Parameters<typeof import("<module>").f>[N]`.
+- [ ] Implement the separate direct `typeof f` path for ambient-script declarations.
+- [ ] Emit each query correctly in TypeScript annotations and JavaScript inline JSDoc.
+- [ ] Verify each injected declaration-backed parameter resolves to a non-error checker type; distinguish intentional declared `any` from unresolved generated `any`.
+- [ ] Preserve and report ordinary declaration diagnostics and generated counterfactual diagnostics.
+- [ ] Add tests where parameter types reference a declaration-local alias, interface, class, and imported type.
+- [ ] Confirm neither the implementation source nor declaration source is modified.
+
+##### 5. Preserve private implementation types
+
+- [ ] For unmatched TypeScript functions, preserve explicit parameter annotations without rewriting them.
+- [ ] For unmatched JavaScript functions, preserve existing inline and function-level JSDoc.
+- [ ] Exercise checker resolution for an unmatched implementation parameter with no explicit annotation and classify the resulting type without guessing from function-body usage.
+- [ ] Label a checker-produced `any` with no explicit source type as `inferred-any`.
+- [ ] Label an explicit implementation `any` as `source-annotation`, not `inferred-any`.
+- [ ] Verify narrowing probes still observe flow-sensitive types when parameters are source-preserved.
+
+##### 6. Thread the strategy through orchestration
+
+- [ ] Extend `AnalyzeSourceOptions` and `AnalyzeFileOptions` without breaking existing `typeText` callers.
+- [ ] Extend package analysis options in `discovery.ts` and resolve one context for each traversed function.
+- [ ] Extend library analysis options in `library.ts` and reuse one parsed declaration index across all functions.
+- [ ] Preserve runtime-discovered file order and function source order in both modes.
+- [ ] Ensure declaration no-match functions are analyzed successfully with source-preserved types.
+- [ ] Ensure ambiguous/incompatible matches use existing per-function failure isolation in library mode.
+- [ ] Assert uniform and TypeScript-defined modes operate over the identical library function inventory.
+
+##### 7. Add CLI validation and output
+
+- [ ] Add `--decl <path>` to `cli.ts` parsing, usage, and mode forwarding.
+- [ ] Reject `--decl` together with `--type` before discovery or source analysis.
+- [ ] Keep neither-flag behavior equivalent to `--type string`.
+- [ ] Allow `--decl` in file, package, and library modes under their existing positional/mode constraints.
+- [ ] Print uniform results as `T = <type>` with no compatibility regression.
+- [ ] Print TypeScript-defined results with declaration path and per-parameter type-source summaries.
+- [ ] Include strategy, context ID, checked parameter types, origins, and matched declaration identity in JSON.
+- [ ] Return nonzero for invalid declaration files and incompatible matched declarations in requested-function modes; retain clean no-match private fallback and library failure isolation semantics.
+
+##### 8. Protect persistence semantics
+
+- [ ] Reject `--decl` with file/package `--sql` until per-parameter context persistence exists.
+- [ ] Confirm library mode continues to reject `--sql` independently of the new strategy.
+- [ ] Leave the existing uniform `edges.type_text` writes unchanged.
+- [ ] Document the future schema need for context ID plus ordered parameter type/origin records.
+
+##### 9. Add end-to-end fixtures and tests
+
+- [ ] Create one JavaScript fixture library with a declaration-matched public function, inline-JSDoc private function, function-level-JSDoc private function, and genuinely untyped private function; add a separate TypeScript file fixture for source annotations.
+- [ ] Add positive file-mode tests for distinct declaration parameter types and optional parameters.
+- [ ] Add negative tests for missing/unreadable/non-`.d.ts` files, syntax errors, ambiguous/overloaded declarations, arity mismatch, and declaration rest parameters.
+- [ ] Add CLI mutual-exclusion and no-flag-default tests.
+- [ ] Run the fixture library in uniform and TypeScript-defined modes and compare complete function IDs.
+- [ ] Assert expected parameter types and origins for every fixture function.
+- [ ] Assert context IDs differ for the same function under different parameter vectors and remain stable for identical vectors.
+- [ ] Assert human and JSON summaries agree on analyzed/failed function counts.
+
+##### 10. Integrate and document `js-yaml`
+
+- [ ] Run library mode with explicit `node_modules/@types/js-yaml/index.d.ts`.
+- [ ] Record counts for declaration-matched functions, source-preserved functions, inferred-any parameters, matched-declaration failures, branches, and unreachable edges.
+- [ ] Inspect name collisions where a private function accidentally shares a public declaration name and refine matching if the fixture rules prove insufficient.
+- [ ] Update `README.md` and `tests/README.md` with `--decl`, precedence, private-function fallback, trust/runtime-discovery warnings, and SQLite limitations.
+- [ ] Update the status and measured js-yaml results in this plan after implementation.
+
+##### 11. Verify the completed extension
+
+- [ ] Run focused declaration, private-type, CLI, package, and library tests during implementation.
+- [ ] Run the complete `npm test` suite.
+- [ ] Run strict TypeScript checking using the repository's established command.
+- [ ] Run representative human and JSON CLI commands in both modes.
+- [ ] Run `git diff --check` and confirm analyzed source/declaration fixtures remain unchanged.
+
+#### Acceptance criteria
+
+- [ ] Omitting both `--type` and `--decl` still analyzes every supported parameter as `string`.
+- [ ] Supplying both flags fails before source analysis with a clear mutual-exclusion error.
+- [ ] `--decl` rejects missing, unreadable, non-`.d.ts`, and syntactically invalid files; ambiguous, overloaded, arity-mismatched, and rest-parameter matches fail that function without falling back to `string`.
+- [ ] A declaration with different parameter types applies the correct type to each implementation parameter by position.
+- [ ] Optional declaration parameters retain `undefined` in their configured type.
+- [ ] Parameter types that reference declaration-local aliases, interfaces, classes, or imported declarations resolve in the instrumented program rather than degrading to unresolved `any`.
+- [ ] Declaration-backed TypeScript and JavaScript inputs produce the expected true/false `never` classifications and leave both source files unchanged.
+- [ ] Uniform and TypeScript-defined modes analyze exactly the same complete fixture-library function inventory.
+- [ ] Unmatched private functions preserve implementation annotations, JSDoc, or inferred types; genuinely untyped parameters remain `any` and are labeled `inferred-any`.
+- [ ] In library mode, incompatible matched declarations are isolated failures and unrelated functions still produce analyses.
+- [ ] Analysis results identify the function-plus-parameter-vector context, allowing one function to have multiple distinct contexts without ID collisions.
+- [ ] Human and JSON output identify each parameter's declaration-backed, source-annotated, inferred, or inferred-any origin; uniform output remains backward compatible.
+- [ ] Existing explicit `--type`, default-string, diagnostics, package traversal, and library discovery tests continue to pass.
+
+#### Non-goals for this extension
+
+- Automatically discovering a package's `types`/`typings` entry or an `@types` package.
+- Inferring runtime export-to-declaration identity beyond the explicit top-level name rule; unmatched functions use source-defined types instead.
+- Supporting declaration overloads, namespace members, methods, constructors, callable variables, declaration merging, or re-export chains.
+- Applying one named declaration type uniformly to unrelated functions; `--type` remains the mechanism for a uniform counterfactual type.
+- Treating declaration conformance, caller argument types, or public export status as evidence of runtime reachability.
+
 ### Phase 7: Expand and persist the call graph — Planned
 
 #### Goal
@@ -453,6 +678,8 @@ Only after Phases 6 and 7 establish a trustworthy library result and call graph 
 4. track a parameter stored in an object field, as js-yaml does with parser state.
 
 Each experiment needs a concrete fixture, semantics for unions of call contexts, a termination budget, and an observed improvement over independent `T` analysis. Avoid building a general taint or abstract-interpretation engine by accident.
+
+The parameterized function-analysis contract from the input-type extension is the handoff point: for every resolved callsite, query each argument's flow-sensitive type in the caller, form the callee's ordered parameter-type vector, and request analysis for that function-plus-vector context. Cache identical contexts, retain distinct vectors as distinct analyses, and define widening or context-count limits before recursively expanding cycles. Uniform and declared-signature library analyses remain useful context-insensitive baselines against which this callsite-sensitive expansion can be measured.
 
 ## Test Matrix
 
