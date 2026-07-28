@@ -99,15 +99,27 @@ function processLibrary(
   const entryFile = path.resolve(lib.entryFile)
   const declFile = lib.declarationFile ? path.resolve(lib.declarationFile) : undefined
 
-  const analyzeArgs = [
-    "run", "analyze", "--",
-    "--sql", dbPath,
-    "--library", entryFile,
-    ...mode.analyzeArgs,
-    ...(mode.suffix === "decl" && declFile ? [declFile] : []),
-  ]
+  const hasEdges = tableExists(dbPath, "edges")
+  const hasCoverage = tableExists(dbPath, "edge_coverage")
 
-  runStep(`  ${mode.label} — static analysis`, "npm", analyzeArgs)
+  if (hasEdges && hasCoverage) {
+    process.stderr.write(`  ${mode.label} — up to date\n`)
+    return dbPath
+  }
+
+  if (!hasEdges) {
+    const analyzeArgs = [
+      "run", "analyze", "--",
+      "--sql", dbPath,
+      "--library", entryFile,
+      ...mode.analyzeArgs,
+      ...(mode.suffix === "decl" && declFile ? [declFile] : []),
+    ]
+
+    runStep(`  ${mode.label} — static analysis`, "npm", analyzeArgs)
+  } else {
+    process.stderr.write(`  ${mode.label} — static analysis (cached)\n`)
+  }
 
   const coverageDir = mkdtempSync(path.join(tmpdir(), "branch-reachability-coverage-"))
   try {
@@ -122,6 +134,19 @@ function processLibrary(
     return dbPath
   } finally {
     rmSync(coverageDir, {recursive: true, force: true})
+  }
+}
+
+function tableExists(dbPath: string, tableName: string): boolean {
+  if (!existsSync(dbPath)) return false
+  const db = new DatabaseSync(dbPath)
+  try {
+    const row = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+    ).get(tableName)
+    return row !== undefined
+  } finally {
+    db.close()
   }
 }
 
