@@ -405,9 +405,10 @@ function main(): void {
       for (const mode of ["decl", "any"] as const) {
         const coverageDir = mkdtempSync(path.join(tmpdir(), `branch-reachability-coverage-${mode}-`))
         try {
-          runStep(`  fuzzing (${mode} mode)`, "node", [
-            "fuzzer.ts", path.resolve(projectRoot, lib.entryFile),
-          ], {env: {NODE_V8_COVERAGE: coverageDir, ITERATIONS: String(iterations)}})
+          const fuzzArgs = mode === "decl"
+            ? ["fuzzer.ts", "--decl", path.resolve(projectRoot, lib.declarationFile), path.resolve(projectRoot, lib.entryFile)]
+            : ["fuzzer.ts", "--type", "any", path.resolve(projectRoot, lib.entryFile)]
+          runStep(`  fuzzing (${mode} mode)`, "node", fuzzArgs, {env: {NODE_V8_COVERAGE: coverageDir, ITERATIONS: String(iterations)}})
 
           runStep(`  coverage import (${mode} mode)`, "npm", [
             "run", "coverage", "--", dbPath, coverageDir,
