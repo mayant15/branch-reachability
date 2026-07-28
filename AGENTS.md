@@ -62,6 +62,40 @@ workflow, and create it only when the user asks or it is part of the task.
 - Diagnostics and unsupported findings are results, not excuses to silently skip
   work or force a green outcome.
 
+## Assertions, preconditions, and data integrity
+
+- **Fail fast on programmer error.** Add a `throw`-time check whenever code
+  makes a tacit assumption about inputs, intermediate state, or output shape.
+  Prefer `throw new Error` over silent fallthroughs or type casts.
+- **Assert numeric ranges.** Any probability, ratio, or bounded value must be
+  checked with `assertInRange(value, label)` or an equivalent guard that throws
+  on `[0, 1]` violations.
+- **Validate external inputs at the boundary.** Declaration files, user-supplied
+  type text, child-process output, V8 coverage JSON, and CLI flags must be
+  schema-checked or structurally validated before use. Reject clearly invalid
+  input rather than propagating it.
+- **Maintain SQLite schema constraints.** Every CHECK, NOT NULL, FOREIGN KEY,
+  and UNIQUE constraint in the `edges` and `edge_coverage` DDL expresses an
+  invariant of the analysis. If you add a column or table, add the
+  corresponding checks. Never weaken constraints without a migration path.
+- **Test structural invariants, not just values.** Each data type
+  (`BranchResult`, `EdgeResult`, `AnalysisResult`, `AnalysisTableRow`) has
+  relationships (parent pointers, cardinalities, field consistency) that tests
+  should assert. Add a test that validates the shape of results from a simple
+  fixture whenever you change a data type.
+- **Verify resource side effects explicitly.** Any new operation that reads
+  files, writes to disk, spawns a process, or modifies shared state must have a
+  test confirming it leaves the filesystem unchanged, cleans up temp files, and
+  does not leak child processes.
+- **Keep probe-instrumentation invariants.** Probe IDs must be unique,
+  probe element order must match parameter order, and every probed identifier
+  must resolve to its original parameter symbol (not a shadowing local).
+  Encode these as throw-time checks in the probe-reading code path.
+- **Preserve determinism.** Edge IDs, context IDs, and classification results
+  must be deterministic for the same source and configuration. New features
+  should not introduce random seeds, iteration order dependence, or
+  environment-sensitive output.
+
 ## Prototype scope
 
 Honor the limitations documented in `PLAN.md`. In particular, Phase 6 currently:

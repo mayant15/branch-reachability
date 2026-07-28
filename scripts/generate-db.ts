@@ -293,6 +293,98 @@ function assertNoNullTypes(): void {
   }
 }
 
+function assertScoreZeroImpliesHitCountZero(): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    const violations = db.prepare(`
+      SELECT e.edge_id, e.decl_score, c.decl_hit_count, e.any_score, c.any_hit_count
+      FROM edges e
+      JOIN coverage c ON c.edge_id = e.edge_id
+      WHERE (e.decl_score = 0 AND c.decl_hit_count != 0)
+         OR (e.any_score = 0 AND c.any_hit_count != 0)
+    `).all() as Array<Record<string, unknown>>
+    if (violations.length > 0) {
+      console.error(
+        `Error: ${violations.length} edges have score 0 but non-zero hit count:\n`
+        + violations.map(v =>
+          `  ${v.edge_id}: decl_score=${v.decl_score} decl_hit_count=${v.decl_hit_count}`
+          + ` any_score=${v.any_score} any_hit_count=${v.any_hit_count}`
+        ).join("\n"),
+      )
+      process.exit(1)
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function assertCoverageCompleteness(): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    const missingCoverage = db.prepare(`
+      SELECT COUNT(*) AS cnt FROM edges
+      WHERE edge != 'baseline'
+        AND edge_id NOT IN (SELECT edge_id FROM coverage)
+    `).get() as {cnt: number}
+    if (missingCoverage.cnt > 0) {
+      console.error(
+        `Error: ${missingCoverage.cnt} non-baseline edges have no coverage row. `
+        + "These edges will be silently dropped from the correlation analysis.",
+      )
+      process.exit(1)
+    }
+
+    const orphanCoverage = db.prepare(`
+      SELECT COUNT(*) AS cnt FROM coverage
+      WHERE edge_id NOT IN (SELECT edge_id FROM edges)
+    `).get() as {cnt: number}
+    if (orphanCoverage.cnt > 0) {
+      console.error(
+        `Error: ${orphanCoverage.cnt} coverage rows reference non-existent edges.`,
+      )
+      process.exit(1)
+    }
+
+    const missingScores = db.prepare(`
+      SELECT COUNT(*) AS cnt FROM edges
+      WHERE edge != 'baseline'
+        AND (decl_score IS NULL OR any_score IS NULL)
+    `).get() as {cnt: number}
+    if (missingScores.cnt > 0) {
+      console.error(
+        `Error: ${missingScores.cnt} non-baseline edges have NULL scores. `
+        + "These edges will be silently dropped from the correlation analysis.",
+      )
+      process.exit(1)
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function assertHitCountsDiverge(): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    const identical = db.prepare(`
+      SELECT COUNT(*) AS cnt FROM coverage
+      WHERE decl_hit_count = any_hit_count
+    `).get() as {cnt: number}
+    const total = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM coverage",
+    ).get() as {cnt: number}
+    if (identical.cnt === total.cnt && total.cnt > 0) {
+      console.error(
+        `Error: all ${total.cnt} coverage rows have decl_hit_count === any_hit_count. `
+        + "The two independent fuzzer runs produced identical hit counts, "
+        + "which indicates a bug (e.g. both modes writing to the same column).",
+      )
+      process.exit(1)
+    }
+  } finally {
+    db.close()
+  }
+}
+
 function printSummary(results: Array<{lib: LibraryConfig; dbPath: string}>): void {
   console.log("\n=== Summary ===")
   const summaryRows: Array<Record<string, string | number>> = []
@@ -419,12 +511,21 @@ function main(): void {
           rmSync(coverageDir, {recursive: true, force: true})
         }
       }
+      assertScoreZeroImpliesHitCountZero()
+      assertCoverageCompleteness()
+      assertHitCountsDiverge()
     } else {
       process.stderr.write("  coverage (cached)\n")
     }
   }
 
   if (libraries.some(l => existsSync(path.resolve(projectRoot, l.entryFile)))) {
+    // Also assert in cached paths where the per-library call above was skipped.
+    if (tableExists("edges") && tableExists("coverage")) {
+      assertScoreZeroImpliesHitCountZero()
+      assertCoverageCompleteness()
+      assertHitCountsDiverge()
+    }
     printSummary(libraries.map(lib => ({lib, dbPath})))
   } else {
     console.error("No libraries processed. Ensure dependencies are installed.")

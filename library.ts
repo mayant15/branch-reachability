@@ -187,6 +187,14 @@ export function discoverLibraryFiles(
     }
   }
 
+  // The dedup loop above should prevent duplicates, but double-check.
+  if (new Set(files).size !== files.length) {
+    throw new Error(
+      `discoverLibraryFiles: duplicate files in result`
+      + ` (${files.length} entries, ${new Set(files).size} unique)`,
+    )
+  }
+
   return {
     entryFile: canonicalEntry,
     libraryRoot: canonicalRoot,

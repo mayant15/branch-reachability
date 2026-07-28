@@ -63,8 +63,34 @@ export function writeAnalysesToSqlite(
 
     database.exec("BEGIN IMMEDIATE")
     try {
+      const allEdgeIds = new Set<string>()
+      const baselineEdgeIds = new Set<string>()
       for (const analysis of analyses) {
         for (const row of getAnalysisTableRows(analysis)) {
+          if (allEdgeIds.has(row.edge_id)) {
+            throw new Error(`Duplicate edge_id ${row.edge_id} across analyses`)
+          }
+          allEdgeIds.add(row.edge_id)
+          if (row.edge === "baseline") {
+            baselineEdgeIds.add(row.edge_id)
+          }
+        }
+      }
+      for (const analysis of analyses) {
+        for (const row of getAnalysisTableRows(analysis)) {
+          if (row.edge !== "baseline") {
+            if (!row.parent_edge_id) {
+              throw new Error(
+                `Non-baseline row ${row.edge_id} has empty parent_edge_id`,
+              )
+            }
+            if (!baselineEdgeIds.has(row.parent_edge_id)) {
+              throw new Error(
+                `Non-baseline row ${row.edge_id} parent ${row.parent_edge_id}`
+                + ` is not a baseline edge in this batch`,
+              )
+            }
+          }
           insert.run(
             row.edge_id,
             row.edge,

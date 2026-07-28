@@ -334,6 +334,13 @@ function toAnalysisTableRow(
   probedTypes: Array<{name: string; type: string}>,
   parentEdgeId: string | null,
 ): AnalysisTableRow {
+  assertInRange(entryProbability, "toAnalysisTableRow.entryProbability")
+  assertInRange(probFromFnEntry, "toAnalysisTableRow.probFromFnEntry")
+  if (location.start.offset > location.end.offset) {
+    throw new Error(
+      `toAnalysisTableRow: start_offset ${location.start.offset} > end_offset ${location.end.offset}`,
+    )
+  }
   const types = probedTypes
     .map(probe => `${probe.name}: ${probe.type}`)
     .join("; ")
@@ -551,6 +558,45 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
       assertInRange(probFromFnEntry, "edge.probFromFnEntry")
       edge.probFromFnEntry = probFromFnEntry
       probFromFnEntryByEdge.set(edge.edgeId, probFromFnEntry)
+    }
+  }
+
+  // Every edge must have a probFromFnEntry set by the loop above.
+  for (const branchResult of branchResults) {
+    for (const edge of branchResult.edges) {
+      if (probFromFnEntryByEdge.get(edge.edgeId) === undefined) {
+        throw new Error(`Edge ${edge.edgeId} was not assigned probFromFnEntry`)
+      }
+    }
+  }
+
+  // Validate branch result structural invariants.
+  for (const branchResult of branchResults) {
+    if (branchResult.edges.length !== 2) {
+      throw new Error(
+        `Branch at ${branchResult.line}:${branchResult.character}`
+        + ` has ${branchResult.edges.length} edges, expected 2`,
+      )
+    }
+    const edgeKinds = new Set(branchResult.edges.map(e => e.edge))
+    if (edgeKinds.size !== 2 || !edgeKinds.has("true") || !edgeKinds.has("false")) {
+      throw new Error(
+        `Branch at ${branchResult.line}:${branchResult.character}`
+        + ` does not have both a true and false edge`,
+      )
+    }
+    for (const edge of branchResult.edges) {
+      if (edge.parentEdgeId !== branchResult.baseline.edgeId) {
+        throw new Error(
+          `Edge ${edge.edgeId} parent is ${edge.parentEdgeId},`
+          + ` but should be its branch baseline ${branchResult.baseline.edgeId}`,
+        )
+      }
+      if (edge.probFromFnEntry < 0 || edge.probFromFnEntry > 1) {
+        throw new Error(
+          `Edge ${edge.edgeId} probFromFnEntry ${edge.probFromFnEntry} is out of [0, 1]`,
+        )
+      }
     }
   }
 
@@ -1364,6 +1410,12 @@ function makeEdgeId(
   start: number,
   end: number,
 ): string {
+  if (start < 0 || end < 0) {
+    throw new Error(`makeEdgeId: negative offset (start=${start}, end=${end})`)
+  }
+  if (start > end) {
+    throw new Error(`makeEdgeId: start ${start} > end ${end}`)
+  }
   const hash = createHash("sha256")
     .update(`${path.resolve(fileName)}:${start}:${end}:${edge}`)
     .digest("hex")
@@ -1372,6 +1424,9 @@ function makeEdgeId(
 }
 
 function sourceSpan(sourceFile: ts.SourceFile, start: number, end: number): SourceSpan {
+  if (start > end) {
+    throw new Error(`sourceSpan: start ${start} > end ${end}`)
+  }
   const startLocation = sourceFile.getLineAndCharacterOfPosition(start)
   const endLocation = sourceFile.getLineAndCharacterOfPosition(end)
   return {

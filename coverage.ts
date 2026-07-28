@@ -134,6 +134,9 @@ export function importV8Coverage(
         INSERT INTO edge_coverage (edge_id, hit_count) VALUES (?, ?)
       `)
       for (const row of rows) {
+        if (row.hit_count < 0) {
+          throw new Error(`Negative hit_count ${row.hit_count} for edge ${row.edge_id}`)
+        }
         insert.run(row.edge_id, row.hit_count)
       }
       database.exec("COMMIT")
@@ -188,6 +191,21 @@ function coverageUrlToPath(url: string): string | undefined {
 }
 
 function findHitCount(edge: EdgeRow, ranges: readonly V8Range[]): number | undefined {
+  for (const range of ranges) {
+    if (range.startOffset < 0 || range.endOffset < 0) {
+      throw new Error(
+        `V8 range has negative offset (${range.startOffset}, ${range.endOffset})`,
+      )
+    }
+    if (range.startOffset > range.endOffset) {
+      throw new Error(
+        `V8 range start ${range.startOffset} > end ${range.endOffset}`,
+      )
+    }
+    if (range.count < 0) {
+      throw new Error(`V8 range has negative count ${range.count}`)
+    }
+  }
   const containing = ranges.filter(range =>
     range.startOffset <= edge.start_offset && range.endOffset >= edge.end_offset
   )
