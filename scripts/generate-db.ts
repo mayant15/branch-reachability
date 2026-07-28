@@ -14,8 +14,7 @@ const usage = `Usage:
 
 Run the full branch-reachability pipeline (static analysis → random fuzzing under
 NODE_V8_COVERAGE → coverage import) for every configured library in two modes:
-declaration-based types and --type any. Produces one SQLite database per
-library-mode combination.
+declaration-based types and --type any. Produces one SQLite database per run.
 
 Options:
   --iterations <n>    Fuzzer iterations per run (default: 100)
@@ -27,21 +26,12 @@ interface LibraryConfig {
   declarationFile: string
 }
 
-interface ModeConfig {
-  label: string
-  suffix: string
-  analyzeArgs: string[]
-}
-
 const libraries: LibraryConfig[] = [
   {name: "js-yaml", entryFile: "node_modules/js-yaml/index.js", declarationFile: "node_modules/@types/js-yaml/index.d.ts"},
-  {name: "sharp", entryFile: "node_modules/sharp/lib/index.js", declarationFile: "node_modules/sharp/lib/index.d.ts"},
+  // {name: "sharp", entryFile: "node_modules/sharp/lib/index.js", declarationFile: "node_modules/sharp/lib/index.d.ts"},
 ]
 
-const modes: ModeConfig[] = [
-  {label: "declaration", suffix: "decl", analyzeArgs: ["--decl"]},
-  {label: "type any", suffix: "any", analyzeArgs: ["--type", "any"]},
-]
+const dbPath = path.resolve(projectRoot, "branch-reachability.sqlite")
 
 function parseCliArgs(): {iterations: number} {
   const parsed = parseArgs({
@@ -90,94 +80,213 @@ function runStep(
   process.stderr.write("done\n")
 }
 
-function processLibrary(
-  lib: LibraryConfig,
-  mode: ModeConfig,
-  iterations: number,
-): string {
-  const dbPath = path.resolve(`${lib.name}-${mode.suffix}.sqlite`)
-  const entryFile = path.resolve(lib.entryFile)
-  const declFile = lib.declarationFile ? path.resolve(lib.declarationFile) : undefined
-
-  const hasEdges = tableExists(dbPath, "edges")
-  const hasCoverage = tableExists(dbPath, "edge_coverage")
-
-  if (hasEdges && hasCoverage) {
-    process.stderr.write(`  ${mode.label} — up to date\n`)
-    return dbPath
-  }
-
-  if (!hasEdges) {
-    const analyzeArgs = [
-      "run", "analyze", "--",
-      "--sql", dbPath,
-      "--library", entryFile,
-      ...mode.analyzeArgs,
-      ...(mode.suffix === "decl" && declFile ? [declFile] : []),
-    ]
-
-    runStep(`  ${mode.label} — static analysis`, "npm", analyzeArgs)
-  } else {
-    process.stderr.write(`  ${mode.label} — static analysis (cached)\n`)
-  }
-
-  const coverageDir = mkdtempSync(path.join(tmpdir(), "branch-reachability-coverage-"))
-  try {
-    runStep(`  ${mode.label} — fuzzing`, "node", [
-      "fuzzer.ts", entryFile,
-    ], {env: {NODE_V8_COVERAGE: coverageDir, ITERATIONS: String(iterations)}})
-
-    runStep(`  ${mode.label} — coverage import`, "npm", [
-      "run", "coverage", "--", dbPath, coverageDir,
-    ])
-
-    return dbPath
-  } finally {
-    rmSync(coverageDir, {recursive: true, force: true})
-  }
-}
-
-function tableExists(dbPath: string, tableName: string): boolean {
+function tableExists(tableName: string): boolean {
   if (!existsSync(dbPath)) return false
   const db = new DatabaseSync(dbPath)
   try {
-    const row = db.prepare(
+    return db.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-    ).get(tableName)
-    return row !== undefined
+    ).get(tableName) !== undefined
   } finally {
     db.close()
   }
 }
 
-function getEdgeCount(dbPath: string): number {
+function columnExists(tableName: string, columnName: string): boolean {
+  if (!existsSync(dbPath)) return false
   const db = new DatabaseSync(dbPath)
   try {
-    return (db.prepare("SELECT COUNT(*) AS cnt FROM edges").get() as {cnt: number}).cnt
+    return (db.prepare(`PRAGMA table_info(\`${tableName}\`)`).all() as Array<{name: string}>)
+      .some(c => c.name === columnName)
   } finally {
     db.close()
   }
 }
 
-function printSummary(results: Array<{lib: LibraryConfig; mode: ModeConfig; dbPath: string}>): void {
+function libraryEdgesPresent(lib: LibraryConfig): boolean {
+  if (!tableExists("edges")) return false
+  const prefix = `${path.resolve(projectRoot, "node_modules", lib.name)}${path.sep}`
+  const db = new DatabaseSync(dbPath)
+  try {
+    const row = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM edges WHERE file_name LIKE ?",
+    ).get(`${prefix}%`) as {cnt: number}
+    return row.cnt > 0
+  } finally {
+    db.close()
+  }
+}
+
+function nullableColumnComplete(tableName: string, columnName: string): boolean {
+  if (!tableExists(tableName) || !columnExists(tableName, columnName)) return false
+  const db = new DatabaseSync(dbPath)
+  try {
+    const row = db.prepare(
+      `SELECT COUNT(*) AS cnt FROM \`${tableName}\` WHERE \`${columnName}\` IS NULL`,
+    ).get() as {cnt: number}
+    return row.cnt === 0
+  } finally {
+    db.close()
+  }
+}
+
+function ensureEdgeSchema(): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS edges (
+        edge_id TEXT PRIMARY KEY,
+        edge TEXT NOT NULL CHECK (edge IN ('baseline', 'true', 'false')),
+        classification TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        start_col INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        end_col INTEGER NOT NULL,
+        start_offset INTEGER NOT NULL,
+        end_offset INTEGER NOT NULL,
+        decl_type TEXT,
+        any_type TEXT,
+        parent_edge_id TEXT REFERENCES edges(edge_id),
+        file_name TEXT NOT NULL,
+        function_name TEXT NOT NULL,
+        type_text TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS edges_parent_edge_id ON edges(parent_edge_id);
+      CREATE INDEX IF NOT EXISTS edges_source ON edges(file_name, function_name);
+    `)
+  } finally {
+    db.close()
+  }
+}
+
+function ensureCoverageSchema(): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS coverage (
+        edge_id TEXT PRIMARY KEY REFERENCES edges(edge_id) ON DELETE CASCADE,
+        decl_hit_count INTEGER NOT NULL DEFAULT 0 CHECK (decl_hit_count >= 0),
+        any_hit_count INTEGER NOT NULL DEFAULT 0 CHECK (any_hit_count >= 0)
+      );
+    `)
+  } finally {
+    db.close()
+  }
+}
+
+function readEdges(sourceDbPath: string): Array<Record<string, unknown>> {
+  const db = new DatabaseSync(sourceDbPath)
+  try {
+    return db.prepare("SELECT * FROM edges").all() as Array<Record<string, unknown>>
+  } finally {
+    db.close()
+  }
+}
+
+function mergeEdgesInto(tempDbPath: string, typeColumn: "decl_type" | "any_type"): void {
+  const srcRows = readEdges(tempDbPath)
+  if (srcRows.length === 0) return
+
+  ensureEdgeSchema()
+  const db = new DatabaseSync(dbPath)
+  try {
+    const insert = db.prepare(`
+      INSERT INTO edges (
+        edge_id, edge, classification,
+        start_line, start_col, end_line, end_col,
+        start_offset, end_offset,
+        decl_type, any_type,
+        parent_edge_id, file_name, function_name, type_text
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(edge_id) DO UPDATE SET
+        \`${typeColumn}\` = COALESCE(excluded.\`${typeColumn}\`, \`${typeColumn}\`)
+    `)
+
+    db.exec("BEGIN IMMEDIATE")
+    try {
+      for (const row of srcRows) {
+        const isDecl = typeColumn === "decl_type"
+        insert.run(
+          row.edge_id, row.edge, row.classification,
+          row.start_line, row.start_col, row.end_line, row.end_col,
+          row.start_offset, row.end_offset,
+          isDecl ? (row as any).probed_types : null,
+          isDecl ? null : (row as any).probed_types,
+          row.parent_edge_id, row.file_name, row.function_name, row.type_text,
+        )
+      }
+      db.exec("COMMIT")
+    } catch (error) {
+      db.exec("ROLLBACK")
+      throw error
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function migrateCoverage(): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    if (!tableExists("edge_coverage")) return
+
+    ensureCoverageSchema()
+    db.exec(`
+      INSERT OR REPLACE INTO coverage (edge_id, decl_hit_count, any_hit_count)
+      SELECT edge_id, hit_count, hit_count FROM edge_coverage
+    `)
+    db.exec("DROP TABLE edge_coverage")
+  } finally {
+    db.close()
+  }
+}
+
+function assertNoNullTypes(): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    const missingDecl = (db.prepare(
+      "SELECT COUNT(*) AS cnt FROM edges WHERE decl_type IS NULL",
+    ).get() as {cnt: number}).cnt
+    const missingAny = (db.prepare(
+      "SELECT COUNT(*) AS cnt FROM edges WHERE any_type IS NULL",
+    ).get() as {cnt: number}).cnt
+    if (missingDecl + missingAny > 0) {
+      console.error(
+        `Error: ${missingDecl} edges missing decl_type and ${missingAny} missing any_type. `
+        + "Branch structure should not depend on parameter type override.",
+      )
+      process.exit(1)
+    }
+  } finally {
+    db.close()
+  }
+}
+
+function printSummary(results: Array<{lib: LibraryConfig; dbPath: string}>): void {
   console.log("\n=== Summary ===")
   const summaryRows: Array<Record<string, string | number>> = []
 
-  for (const {lib, mode, dbPath} of results) {
+  for (const {lib} of results) {
     const db = new DatabaseSync(dbPath)
     try {
-      const edgeCount = (db.prepare("SELECT COUNT(*) AS cnt FROM edges").get() as {cnt: number}).cnt
-      const coverageCount = (db.prepare("SELECT COUNT(*) AS cnt FROM edge_coverage").get() as {cnt: number}).cnt
-      const hitSum = (db.prepare("SELECT COALESCE(SUM(hit_count), 0) AS total FROM edge_coverage").get() as {total: number}).total
+      const libPrefix = `${path.resolve(projectRoot, "node_modules", lib.name)}${path.sep}`
+      const edgeCount = (db.prepare(
+        "SELECT COUNT(*) AS cnt FROM edges WHERE file_name LIKE ?",
+      ).get(`${libPrefix}%`) as {cnt: number}).cnt
+      const coverageCount = (db.prepare(
+        "SELECT COUNT(*) AS cnt FROM coverage c JOIN edges e ON c.edge_id = e.edge_id WHERE e.file_name LIKE ?",
+      ).get(`${libPrefix}%`) as {cnt: number}).cnt
+      const hitSum = (db.prepare(
+        "SELECT COALESCE(SUM(c.decl_hit_count), 0) AS total FROM coverage c JOIN edges e ON c.edge_id = e.edge_id WHERE e.file_name LIKE ?",
+      ).get(`${libPrefix}%`) as {total: number}).total
       const unreachable = (db.prepare(
-        "SELECT COUNT(*) AS cnt FROM edges WHERE edge IN ('true','false') AND classification = 'newly-unreachable'",
-      ).get() as {cnt: number}).cnt
+        "SELECT COUNT(*) AS cnt FROM edges WHERE file_name LIKE ? AND edge IN ('true','false') AND classification = 'newly-unreachable'",
+      ).get(`${libPrefix}%`) as {cnt: number}).cnt
       const inherited = (db.prepare(
-        "SELECT COUNT(*) AS cnt FROM edges WHERE edge IN ('true','false') AND classification = 'inherited-unreachable'",
-      ).get() as {cnt: number}).cnt
+        "SELECT COUNT(*) AS cnt FROM edges WHERE file_name LIKE ? AND edge IN ('true','false') AND classification = 'inherited-unreachable'",
+      ).get(`${libPrefix}%`) as {cnt: number}).cnt
       summaryRows.push({
         library: lib.name,
-        mode: mode.label,
         edges: edgeCount,
         covered: coverageCount,
         hits: hitSum,
@@ -194,40 +303,94 @@ function printSummary(results: Array<{lib: LibraryConfig; mode: ModeConfig; dbPa
 
 function main(): void {
   const {iterations} = parseCliArgs()
-  const results: Array<{lib: LibraryConfig; mode: ModeConfig; dbPath: string}> = []
+
+  const hasNewSchema = tableExists("edges") && columnExists("edges", "decl_type")
+  const hasCoverage = tableExists("coverage")
+
+  if (hasNewSchema && hasCoverage) {
+    const allPresent = libraries.every(libraryEdgesPresent)
+    if (allPresent) {
+      console.log("All up to date.")
+      printSummary(libraries.map(lib => ({lib, dbPath})))
+      return
+    }
+  }
+
+  if (tableExists("edges") && !columnExists("edges", "decl_type")) {
+    rmSync(dbPath)
+  }
+
+  const coverageDirs: string[] = []
 
   for (const lib of libraries) {
-    if (!existsSync(path.resolve(lib.entryFile))) {
+    if (!existsSync(path.resolve(projectRoot, lib.entryFile))) {
       console.error(`Warning: ${lib.entryFile} not found — skipping ${lib.name}`)
       continue
     }
 
     console.log(`\n${lib.name}:`)
-    for (const mode of modes) {
-      const dbPath = processLibrary(lib, mode, iterations)
-      results.push({lib, mode, dbPath})
-    }
-  }
 
-  // Assert matching edge counts between decl and any modes per library
-  for (const lib of libraries) {
-    const declPath = results.find(r => r.lib.name === lib.name && r.mode.suffix === "decl")?.dbPath
-    const anyPath = results.find(r => r.lib.name === lib.name && r.mode.suffix === "any")?.dbPath
-    if (declPath && anyPath) {
-      const declEdges = getEdgeCount(declPath)
-      const anyEdges = getEdgeCount(anyPath)
-      if (declEdges !== anyEdges) {
-        console.error(
-          `Error: ${lib.name} has ${declEdges} edges in declaration mode but ${anyEdges} in --type any mode. `
-          + "Branch structure should not depend on parameter type override.",
-        )
-        process.exit(1)
+    if (!libraryEdgesPresent(lib)) {
+      const declFile = lib.declarationFile ? path.resolve(projectRoot, lib.declarationFile) : undefined
+
+      const tmpDecl = path.resolve(projectRoot, `${lib.name}-decl-tmp.sqlite`)
+      const tmpAny = path.resolve(projectRoot, `${lib.name}-any-tmp.sqlite`)
+      try {
+        const declArgs = [
+          "run", "analyze", "--",
+          "--sql", tmpDecl,
+          "--library", path.resolve(projectRoot, lib.entryFile),
+          "--decl",
+        ]
+        if (declFile) declArgs.push(declFile)
+        runStep("  declaration — static analysis", "npm", declArgs)
+        mergeEdgesInto(tmpDecl, "decl_type")
+
+        const anyArgs = [
+          "run", "analyze", "--",
+          "--sql", tmpAny,
+          "--library", path.resolve(projectRoot, lib.entryFile),
+          "--type", "any",
+        ]
+        runStep("  type any — static analysis", "npm", anyArgs)
+        mergeEdgesInto(tmpAny, "any_type")
+
+        assertNoNullTypes()
+      } finally {
+        for (const tmp of [tmpDecl, tmpAny]) {
+          if (existsSync(tmp)) rmSync(tmp)
+        }
       }
+    } else {
+      const declOk = nullableColumnComplete("edges", "decl_type")
+      const anyOk = nullableColumnComplete("edges", "any_type")
+      if (declOk) process.stderr.write("  declaration — static analysis (cached)\n")
+      if (anyOk) process.stderr.write("  type any — static analysis (cached)\n")
+    }
+
+    if (!hasCoverage) {
+      const coverageDir = mkdtempSync(path.join(tmpdir(), "branch-reachability-coverage-"))
+      runStep("  fuzzing", "node", [
+        "fuzzer.ts", path.resolve(projectRoot, lib.entryFile),
+      ], {env: {NODE_V8_COVERAGE: coverageDir, ITERATIONS: String(iterations)}})
+      coverageDirs.push(coverageDir)
+    } else {
+      process.stderr.write("  coverage (cached)\n")
     }
   }
 
-  if (results.length > 0) {
-    printSummary(results)
+  if (!hasCoverage && coverageDirs.length > 0) {
+    runStep("  coverage import", "npm", [
+      "run", "coverage", "--", dbPath, ...coverageDirs,
+    ])
+    migrateCoverage()
+    for (const dir of coverageDirs) {
+      rmSync(dir, {recursive: true, force: true})
+    }
+  }
+
+  if (libraries.some(l => existsSync(path.resolve(projectRoot, l.entryFile)))) {
+    printSummary(libraries.map(lib => ({lib, dbPath})))
   } else {
     console.error("No libraries processed. Ensure dependencies are installed.")
     process.exit(1)
