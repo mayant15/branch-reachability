@@ -1,6 +1,6 @@
 import {parseArgs} from "node:util"
 import {analyzePackageExport, formatPackageAnalysisResult} from "./discovery.ts"
-import {analyzeFile, printAnalysisResult} from "./index.ts"
+import {analyzeFile, type AnalysisResult, printAnalysisResult} from "./index.ts"
 import {analyzeLibrary, printLibraryAnalysisResult} from "./library.ts"
 import {writeAnalysesToSqlite, writeAnalysisToSqlite} from "./sqlite-output.ts"
 
@@ -52,7 +52,7 @@ try {
     process.exitCode = 0
   } else if (parsed.values.type && parsed.values.decl) {
     throw new Error("--type and --decl cannot be used together")
-  } else if (parsed.values.decl && parsed.values.sql) {
+  } else if (parsed.values.decl && parsed.values.sql && !parsed.values.library) {
     throw new Error("--decl cannot be combined with --sql")
   } else if (parsed.values.project && parsed.values["no-project"]) {
     throw new Error("--project and --no-project cannot be used together")
@@ -65,10 +65,9 @@ try {
       || parsed.values["max-functions"]
       || parsed.values.project
       || parsed.values["no-project"]
-      || parsed.values.sql
     ) {
       throw new Error(
-        "--library cannot be combined with positional, package, traversal, project, or SQL options",
+        "--library cannot be combined with positional, package, traversal, or project options",
       )
     }
     const result = analyzeLibrary({
@@ -77,6 +76,17 @@ try {
       typeText: parsed.values.type,
       declarationFile: parsed.values.decl,
     })
+    if (parsed.values.sql) {
+      const analyses: AnalysisResult[] = []
+      for (const file of result.files) {
+        for (const fn of file.functions) {
+          if (fn.status === "analyzed") {
+            analyses.push(fn.analysis)
+          }
+        }
+      }
+      writeAnalysesToSqlite(parsed.values.sql, analyses)
+    }
     if (parsed.values.json) {
       console.log(JSON.stringify(result, null, 2))
     } else {

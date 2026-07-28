@@ -6,6 +6,8 @@
   "scripts": {
     "analyze": "node cli.ts",
     "coverage": "node coverage.ts",
+    "db": "node scripts/generate-db.ts",
+    "fuzz": "node fuzzer.ts",
     "test": "node --test index.test.ts"
   },
   "license": "ISC",

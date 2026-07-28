@@ -169,6 +169,36 @@ sqlite3 ./js-yaml-edges.sqlite '
 '
 ```
 
+## Combined static and dynamic database
+
+Generate databases with static branch classifications and runtime hit counts
+for all configured libraries in both declaration and `--type any` modes:
+
+```sh
+npm run db
+```
+
+The pipeline runs static analysis, random fuzzing under `NODE_V8_COVERAGE`, and
+coverage import for every combination. Results are saved as `<name>-any.sqlite`
+and `<name>-decl.sqlite` per library.
+
+Each database has two related tables:
+
+- `edges` — static analysis (baseline, true, false edges with classifications)
+- `edge_coverage` — runtime hit counts keyed to `edge_id`
+
+Query them together to compare static unreachability with dynamic coverage:
+
+```sh
+sqlite3 ./js-yaml-any.sqlite '
+  SELECT e.edge_id, e.edge, e.classification, c.hit_count,
+         e.file_name, e.function_name
+  FROM edge_coverage c JOIN edges e USING (edge_id)
+  ORDER BY c.hit_count, e.file_name, e.start_offset
+  LIMIT 15;
+'
+```
+
 ## Unsupported functions and branches
 
 Phase 1 requires every parameter to be a simple identifier without rest syntax or a default. Each of these commands rejects the entire selected function and explains why:

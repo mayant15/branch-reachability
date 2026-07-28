@@ -21,6 +21,7 @@ for broader support.
   inventory, and library orchestration.
 - `sqlite-output.ts`: branch-edge persistence.
 - `coverage.ts`: V8 coverage import into an existing edge database.
+- `fuzzer.ts`: random-input fuzzer for V8 coverage generation.
 - `index.test.ts`: automated regression suite.
 - `tests/`: manually runnable CLI examples; commands live in `tests/README.md`.
 - `coverage/v8/js-yaml/`: committed raw V8 regression fixtures.
@@ -106,10 +107,7 @@ change run:
 
 ```sh
 npm test
-npx tsc --noEmit --strict --noUnusedLocals \
-  --target esnext --module nodenext --moduleResolution nodenext \
-  --allowImportingTsExtensions --types node \
-  index.ts discovery.ts sqlite-output.ts coverage.ts library.ts index.test.ts cli.ts
+npx tsc --noEmit
 git diff --check
 ```
 
@@ -118,10 +116,7 @@ repository development shell:
 
 ```sh
 nix develop -c npm test
-nix develop -c npx tsc --noEmit --strict --noUnusedLocals \
-  --target esnext --module nodenext --moduleResolution nodenext \
-  --allowImportingTsExtensions --types node \
-  index.ts discovery.ts sqlite-output.ts coverage.ts library.ts index.test.ts cli.ts
+nix develop -c npx tsc --noEmit
 ```
 
 Do not regenerate or rewrite the committed V8 JSON fixtures merely to make a test

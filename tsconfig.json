@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUnusedLocals": true,
+    "noEmit": true,
+    "target": "esnext",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "types": ["node"]
+  },
+  "include": [
+    "cli.ts",
+    "coverage.ts",
+    "discovery.ts",
+    "fuzzer.ts",
+    "index.ts",
+    "index.test.ts",
+    "library.ts",
+    "sqlite-output.ts"
+  ]
+}
