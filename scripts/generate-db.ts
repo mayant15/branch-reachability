@@ -17,7 +17,7 @@ NODE_V8_COVERAGE → coverage import) for every configured library in two modes:
 declaration-based types and --type any. Produces one SQLite database per run.
 
 Options:
-  --iterations <n>    Fuzzer iterations per run (default: 100)
+  --iterations <n>    Fuzzer iterations per run (default: 100000)
   --help              Show this help`
 
 interface LibraryConfig {
@@ -49,7 +49,7 @@ function parseCliArgs(): {iterations: number} {
   }
 
   return {
-    iterations: parsed.values.iterations ? Number(parsed.values.iterations) : 100,
+    iterations: parsed.values.iterations ? Number(parsed.values.iterations) : 100000,
   }
 }
 
@@ -236,17 +236,37 @@ function mergeEdgesInto(tempDbPath: string, typeColumn: "decl_type" | "any_type"
   }
 }
 
-function migrateCoverage(): void {
+function mergeEdgeCoverage(hitColumn: "decl_hit_count" | "any_hit_count"): void {
   const db = new DatabaseSync(dbPath)
   try {
     if (!tableExists("edge_coverage")) return
 
     ensureCoverageSchema()
-    db.exec(`
-      INSERT OR REPLACE INTO coverage (edge_id, decl_hit_count, any_hit_count)
-      SELECT edge_id, hit_count, hit_count FROM edge_coverage
-    `)
-    db.exec("DROP TABLE edge_coverage")
+    db.exec("BEGIN IMMEDIATE")
+    try {
+      // Ensure a row exists for every edge_coverage entry
+      const rows = db.prepare(
+        "SELECT edge_id FROM edge_coverage",
+      ).all() as Array<{edge_id: string}>
+      const insertRow = db.prepare(
+        "INSERT OR IGNORE INTO coverage (edge_id, decl_hit_count, any_hit_count) VALUES (?, 0, 0)",
+      )
+      for (const {edge_id} of rows) {
+        insertRow.run(edge_id)
+      }
+      db.prepare(`
+        UPDATE coverage SET \`${hitColumn}\` = (
+          SELECT hit_count FROM edge_coverage
+          WHERE edge_coverage.edge_id = coverage.edge_id
+        )
+        WHERE edge_id IN (SELECT edge_id FROM edge_coverage)
+      `).run()
+      db.exec("DROP TABLE edge_coverage")
+      db.exec("COMMIT")
+    } catch (error) {
+      db.exec("ROLLBACK")
+      throw error
+    }
   } finally {
     db.close()
   }
@@ -331,8 +351,6 @@ function main(): void {
     rmSync(dbPath)
   }
 
-  const coverageDirs: string[] = []
-
   for (const lib of libraries) {
     if (!existsSync(path.resolve(projectRoot, lib.entryFile))) {
       console.error(`Warning: ${lib.entryFile} not found — skipping ${lib.name}`)
@@ -380,23 +398,28 @@ function main(): void {
     }
 
     if (!hasCoverage) {
-      const coverageDir = mkdtempSync(path.join(tmpdir(), "branch-reachability-coverage-"))
-      runStep("  fuzzing", "node", [
-        "fuzzer.ts", path.resolve(projectRoot, lib.entryFile),
-      ], {env: {NODE_V8_COVERAGE: coverageDir, ITERATIONS: String(iterations)}})
-      coverageDirs.push(coverageDir)
+      // Fuzzing + coverage import → mode-specific hit count.
+      // Each mode runs the same JavaScript, so hit counts are expected to match,
+      // but the pipeline tracks them separately so mode-specific coverage
+      // (e.g. from instrumented execution) can be plugged in later.
+      for (const mode of ["decl", "any"] as const) {
+        const coverageDir = mkdtempSync(path.join(tmpdir(), `branch-reachability-coverage-${mode}-`))
+        try {
+          runStep(`  fuzzing (${mode} mode)`, "node", [
+            "fuzzer.ts", path.resolve(projectRoot, lib.entryFile),
+          ], {env: {NODE_V8_COVERAGE: coverageDir, ITERATIONS: String(iterations)}})
+
+          runStep(`  coverage import (${mode} mode)`, "npm", [
+            "run", "coverage", "--", dbPath, coverageDir,
+          ])
+          const hitColumn = mode === "decl" ? "decl_hit_count" : "any_hit_count"
+          mergeEdgeCoverage(hitColumn)
+        } finally {
+          rmSync(coverageDir, {recursive: true, force: true})
+        }
+      }
     } else {
       process.stderr.write("  coverage (cached)\n")
-    }
-  }
-
-  if (!hasCoverage && coverageDirs.length > 0) {
-    runStep("  coverage import", "npm", [
-      "run", "coverage", "--", dbPath, ...coverageDirs,
-    ])
-    migrateCoverage()
-    for (const dir of coverageDirs) {
-      rmSync(dir, {recursive: true, force: true})
     }
   }
 
