@@ -138,8 +138,8 @@ function ensureEdgeSchema(): void {
         edge_id TEXT PRIMARY KEY,
         edge TEXT NOT NULL CHECK (edge IN ('baseline', 'true', 'false')),
         classification TEXT NOT NULL CHECK (classification IN ('', 'reachable', 'newly-unreachable', 'inherited-unreachable')),
-        entry_probability REAL NOT NULL CHECK (entry_probability >= 0 AND entry_probability <= 1),
-        prob_from_fn_entry REAL NOT NULL CHECK (prob_from_fn_entry >= 0 AND prob_from_fn_entry <= 1),
+        decl_score REAL CHECK (decl_score >= 0 AND decl_score <= 1),
+        any_score REAL CHECK (any_score >= 0 AND any_score <= 1),
         start_line INTEGER NOT NULL,
         start_col INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
@@ -192,6 +192,7 @@ function readEdges(sourceDbPath: string): Array<Record<string, unknown>> {
 function mergeEdgesInto(tempDbPath: string, typeColumn: "decl_type" | "any_type"): void {
   const srcRows = readEdges(tempDbPath)
   if (srcRows.length === 0) return
+  const probColumn = typeColumn.replace("_type", "_score")
 
   ensureEdgeSchema()
   const db = new DatabaseSync(dbPath)
@@ -199,15 +200,14 @@ function mergeEdgesInto(tempDbPath: string, typeColumn: "decl_type" | "any_type"
     const insert = db.prepare(`
       INSERT INTO edges (
         edge_id, edge, classification,
-        entry_probability, prob_from_fn_entry,
         start_line, start_col, end_line, end_col,
         start_offset, end_offset,
         decl_type, any_type,
+        decl_score, any_score,
         parent_edge_id, file_name, function_name, type_text
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(edge_id) DO UPDATE SET
-        entry_probability = COALESCE(excluded.entry_probability, entry_probability),
-        prob_from_fn_entry = COALESCE(excluded.prob_from_fn_entry, prob_from_fn_entry),
+        \`${probColumn}\` = COALESCE(excluded.\`${probColumn}\`, \`${probColumn}\`),
         \`${typeColumn}\` = COALESCE(excluded.\`${typeColumn}\`, \`${typeColumn}\`)
     `)
 
@@ -215,13 +215,14 @@ function mergeEdgesInto(tempDbPath: string, typeColumn: "decl_type" | "any_type"
     try {
       for (const row of srcRows) {
         const isDecl = typeColumn === "decl_type"
+        const [declType, anyType] = isDecl ? [row.probed_types, null] : [null, row.probed_types]
+        const [declProb, anyProb] = isDecl ? [row.prob_from_fn_entry, null] : [null, row.prob_from_fn_entry]
         insert.run(
           row.edge_id, row.edge, row.classification,
-          row.entry_probability, row.prob_from_fn_entry,
           row.start_line, row.start_col, row.end_line, row.end_col,
           row.start_offset, row.end_offset,
-          isDecl ? (row as any).probed_types : null,
-          isDecl ? null : (row as any).probed_types,
+          declType, anyType,
+          declProb, anyProb,
           row.parent_edge_id, row.file_name, row.function_name, row.type_text,
         )
       }
