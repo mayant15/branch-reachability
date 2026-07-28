@@ -2,12 +2,17 @@ import {existsSync, readFileSync, realpathSync} from "node:fs"
 import path from "node:path"
 import {spawnSync} from "node:child_process"
 import ts from "typescript"
-import {analyzeFile, type AnalysisResult} from "./index.ts"
+import {
+  analyzeFile,
+  createDeclarationAnalysisSession,
+  type AnalysisResult,
+} from "./index.ts"
 
 export interface AnalyzeLibraryOptions {
   entryFile: string
   libraryRoot?: string
   typeText?: string
+  declarationFile?: string
   timeoutMs?: number
 }
 
@@ -69,6 +74,7 @@ export interface LibraryAnalysisResult {
   entryFile: string
   libraryRoot: string
   typeText: string
+  declarationFile?: string
   discovery: LibraryDiscoveryResult
   files: LibraryFileResult[]
   summary: LibraryAnalysisSummary
@@ -226,11 +232,17 @@ export function inventoryTopLevelFunctions(fileName: string): TopLevelFunction[]
 }
 
 export function analyzeLibrary(options: AnalyzeLibraryOptions): LibraryAnalysisResult {
+  if (options.typeText !== undefined && options.declarationFile !== undefined) {
+    throw new Error("typeText and declarationFile cannot be used together")
+  }
   const discovered = discoverLibraryFiles(
     options.entryFile,
     options.libraryRoot,
     options.timeoutMs,
   )
+  const declarationSession = options.declarationFile === undefined
+    ? undefined
+    : createDeclarationAnalysisSession()
   const files: LibraryFileResult[] = []
   for (const fileName of discovered.discovery.files) {
     let inventory: TopLevelFunction[]
@@ -250,6 +262,8 @@ export function analyzeLibrary(options: AnalyzeLibraryOptions): LibraryAnalysisR
             functionName: target.functionName,
             functionPosition: target.startOffset,
             typeText: options.typeText,
+            declarationFile: options.declarationFile,
+            declarationSession,
             tsconfig: false,
           }),
         }
@@ -263,7 +277,12 @@ export function analyzeLibrary(options: AnalyzeLibraryOptions): LibraryAnalysisR
   return {
     entryFile: discovered.entryFile,
     libraryRoot: discovered.libraryRoot,
-    typeText: options.typeText ?? "string",
+    typeText: options.declarationFile === undefined
+      ? options.typeText ?? "string"
+      : "TypeScript-defined",
+    declarationFile: options.declarationFile === undefined
+      ? undefined
+      : path.resolve(options.declarationFile),
     discovery: discovered.discovery,
     files,
     summary: summarize(files, discovered.discovery.excludedFiles.length),
@@ -271,7 +290,10 @@ export function analyzeLibrary(options: AnalyzeLibraryOptions): LibraryAnalysisR
 }
 
 export function printLibraryAnalysisResult(result: LibraryAnalysisResult): void {
-  console.log(`${result.entryFile} (library T = ${result.typeText})`)
+  const input = result.typeText === "TypeScript-defined"
+    ? `types from ${result.declarationFile}`
+    : `T = ${result.typeText}`
+  console.log(`${result.entryFile} (library ${input})`)
   console.log(`Discovery: ${result.discovery.status}`)
   if (result.discovery.error) {
     console.log(`Discovery error: ${result.discovery.error}`)

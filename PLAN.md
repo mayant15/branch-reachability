@@ -33,7 +33,7 @@ The `coverage.ts` entry point is available through `npm run coverage`. It import
 
 The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Forty-four tests in `index.test.ts` cover Phases 1 through 6, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
+Fifty-one tests in `index.test.ts` cover Phases 1 through 6, declaration-backed and source-preserved parameter contexts, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -50,7 +50,7 @@ The `tests/` directory contains manually runnable end-to-end CLI fixtures for ba
 ### Roadmap at a glance
 
 1. **Phase 6 — Library-level analysis (complete):** execute a CommonJS entry file to discover its package-owned file closure, enumerate every direct top-level named function declaration, and analyze each independently in one job.
-2. **Input-type extension — Parameterized function analysis:** make the core analysis consume a function identity plus an ordered parameter-type vector. `--type` produces a uniform vector, `--decl <path>` produces the exact per-function vector declared by TypeScript, and no flag retains the `string` fallback.
+2. **Input-type extension — Parameterized function analysis (complete):** the core analysis consumes a function identity plus an ordered parameter-type vector. `--type` produces a uniform vector, `--decl <path>` produces the exact per-function vector TypeScript sees, and no flag retains the `string` fallback.
 3. **Phase 7 — Call-graph expansion:** promote discovery to explicit function and callsite records, broaden static callee resolution in measured steps, and retain unresolved or ambiguous edges rather than guessing.
 4. **Later contextual analysis:** only after the graph is reliable, evaluate caller-to-callee type specialization, aliases, and object-property provenance as separate experiments.
 
@@ -407,7 +407,7 @@ Current js-yaml result with `T = string`:
 - Library/file/function ownership is not persisted to SQLite; library-aware persistence is deferred until a concrete consumer needs it.
 - There is no call graph, export reachability, caller-specific type propagation, source-map remapping, or asynchronous module-settling policy in Phase 6.
 
-### Input-type extension: Load parameter types from an explicit declaration file — Planned
+### Input-type extension: Load parameter types from an explicit declaration file — Complete
 
 #### Goal and CLI contract
 
@@ -441,7 +441,7 @@ Declared mode must analyze the complete function inventory. Public package decla
 Parse the supplied declaration file in its own TypeScript `Program` and use the checker rather than extracting type text with regular expressions. For an analyzed runtime function named `f`:
 
 1. Find exported or ambient, bodyless function declarations named `f` in the declaration file's top-level module/source scope. Class and interface methods, constructors, callable variables, namespace members, and re-exports are deferred.
-2. If there is no match, classify the function as private/unmatched and use its implementation-source parameter types. If there is more than one match or an overload set, report ambiguity explicitly rather than selecting one by source order or silently treating the function as private.
+2. If there is no match, classify the function as private/unmatched and use its implementation-source parameter types. For a compatible overload set, union each parameter position across signatures; do not silently select TypeScript's last overload.
 3. Match source parameters to declaration parameters by position. Names need not agree, but arity must agree exactly in the first increment.
 4. Reject declaration rest parameters. Preserve optional declaration semantics: the configured type for an optional parameter includes `undefined`, as represented by TypeScript for that parameter position.
 5. Continue to enforce the runtime source restrictions already required for safe rewriting: every implementation parameter must be a simple, non-rest identifier without a default initializer or other unsupported modifier.
@@ -464,9 +464,9 @@ Declaration types can reference aliases, interfaces, classes, imports, and quali
 4. Query the generated parameter node once before branch classification and verify that its checker type is not unresolved `any` because of a generated-name or module-resolution error. Keep all ordinary declaration and counterfactual diagnostics in the result.
 5. Keep declaration-file text and generated import references virtual/read-only; never edit the supplied `.d.ts` or implementation source.
 
-Before implementation, validate the exact import-type spelling under the repository's NodeNext settings for absolute declaration paths and `.d.ts` extensions. Prefer a relative module specifier accepted by TypeScript over enabling broad compiler options solely to permit generated imports. Ambient-script declarations need a separate path because they are global rather than module exports.
+Generated module queries use relative specifiers that retain the `.d.ts` extension. This works for CommonJS and NodeNext ESM TypeScript/JSDoc inputs without enabling unrelated compiler options or triggering TS2834. Ambient-script declarations use direct declaration type expressions because they are global rather than module exports.
 
-Overload handling is intentionally rejected at first. `Parameters<typeof f>` observes only one effective overload signature and would silently discard the others; accepting overloads requires a separately defined policy such as one analysis per signature or a position-wise union.
+For one declaration, `Parameters<typeof f>` provides each positional type. Because that utility observes only the last overload, compatible overload sets instead receive virtual declaration-local aliases whose types are position-wise unions of every signature. The aliases are added only to the in-memory declaration copy. Overloads with incompatible arity and declaration rest parameters remain focused failures.
 
 #### API and result contract
 
@@ -501,103 +501,110 @@ Complete these groups in order. Keep uniform mode green after each group so the 
 
 ##### 1. Freeze the existing uniform contract
 
-- [ ] Add or tighten API tests proving omitted `typeText` resolves to `string` for TypeScript and JavaScript.
-- [ ] Add a CLI regression test for `--type 'string | number'` in file mode.
-- [ ] Add a library regression assertion that one uniform type is applied to every supported parameter of every inventoried function.
-- [ ] Record the current human/JSON shape and SQLite `type_text` behavior that must remain compatible in uniform mode.
+- [x] Add or tighten API tests proving omitted `typeText` resolves to `string` for TypeScript and JavaScript.
+- [x] Add a CLI regression test for `--type 'string | number'` in file mode.
+- [x] Add a library regression assertion that one uniform type is applied to every supported parameter of every inventoried function.
+- [x] Record the current human/JSON shape and SQLite `type_text` behavior that must remain compatible in uniform mode.
 
 ##### 2. Introduce input strategies and resolved contexts in `index.ts`
 
-- [ ] Define a job-level input strategy for uniform and declaration modes; retain `typeText` as the backward-compatible uniform shorthand.
-- [ ] Define an ordered resolved parameter input with an override expression or a source-preserved marker.
-- [ ] Define parameter type-source metadata: `uniform-default`, `uniform-explicit`, `declaration`, `source-annotation`, `source-jsdoc`, `inferred`, and `inferred-any`.
-- [ ] Define a resolved analysis context containing stable function identity and ordered parameter inputs.
-- [ ] Validate that the resolved parameter vector length equals the implementation function arity before planning edits.
-- [ ] Refactor `planParameterEdits` to consume the vector: inject override expressions and leave source-preserved parameters untouched.
-- [ ] Keep all current unsupported implementation-parameter checks unchanged in both strategies.
-- [ ] Derive the checked parameter type strings and type-source metadata from the fresh virtual program.
-- [ ] Derive a deterministic context ID from the stable function ID plus the ordered checked parameter-type identities.
-- [ ] Adapt uniform mode to build a repeated override vector and prove existing branch classifications and diagnostics are unchanged.
+- [x] Define a job-level input strategy for uniform and declaration modes; retain `typeText` as the backward-compatible uniform shorthand.
+- [x] Define an ordered resolved parameter input with an override expression or a source-preserved marker.
+- [x] Define parameter type-source metadata: `uniform-default`, `uniform-explicit`, `declaration`, `source-annotation`, `source-jsdoc`, `inferred`, and `inferred-any`.
+- [x] Define a resolved analysis context containing stable function identity and ordered parameter inputs.
+- [x] Validate that the resolved parameter vector length equals the implementation function arity before planning edits.
+- [x] Refactor `planParameterEdits` to consume the vector: inject override expressions and leave source-preserved parameters untouched.
+- [x] Keep all current unsupported implementation-parameter checks unchanged in both strategies.
+- [x] Derive the checked parameter type strings and type-source metadata from the fresh virtual program.
+- [x] Derive a deterministic context ID from the stable function ID plus the ordered checked parameter-type identities.
+- [x] Adapt uniform mode to build a repeated override vector and prove existing branch classifications and diagnostics are unchanged.
 
 ##### 3. Implement explicit declaration loading and matching
 
-- [ ] Add a declaration resolver that canonicalizes the supplied path and requires a readable `.d.ts` file.
-- [ ] Parse the declaration and return its syntactic/configuration diagnostics before analyzing functions.
-- [ ] Build an index of supported top-level exported or ambient bodyless function declarations by name.
-- [ ] Distinguish no match, one match, overload/multiple matches, and unsupported matched declaration forms.
-- [ ] Treat no match as a private function whose complete parameter vector is source-preserved.
-- [ ] For one match, validate positional arity and reject declaration rest parameters.
-- [ ] Preserve optional declaration parameter semantics, including `undefined`.
-- [ ] Treat an ambiguous or incompatible match as a focused function failure; never reinterpret it as private and never fall back to `string`.
-- [ ] Store canonical declaration file, declaration span, and matched function name in the resolved context.
+- [x] Add a declaration resolver that canonicalizes the supplied path and requires a readable `.d.ts` file.
+- [x] Parse the declaration and reject its syntactic or semantic diagnostics before analyzing functions.
+- [x] Build and cache an index of supported top-level exported or ambient bodyless function declarations by name.
+- [x] Distinguish no match, one match, compatible overloads, and unsupported matched declaration forms.
+- [x] Treat no match as a private function whose complete parameter vector is source-preserved.
+- [x] Validate positional arity and reject declaration rest parameters.
+- [x] Preserve optional declaration parameter semantics, including `undefined`.
+- [x] Treat an incompatible match as a focused function failure; never reinterpret it as private and never fall back to `string`.
+- [x] Store canonical declaration file, declaration span, and matched function name in the resolved context.
 
 ##### 4. Make declaration type references resolvable
 
-- [ ] Include the explicit declaration file and its imported declarations in the virtual analysis program.
-- [ ] Validate a relative import-type spelling under NodeNext for module `.d.ts` files without enabling unrelated compiler options.
-- [ ] Generate a per-position exported declaration query equivalent to `Parameters<typeof import("<module>").f>[N]`.
-- [ ] Implement the separate direct `typeof f` path for ambient-script declarations.
-- [ ] Emit each query correctly in TypeScript annotations and JavaScript inline JSDoc.
-- [ ] Verify each injected declaration-backed parameter resolves to a non-error checker type; distinguish intentional declared `any` from unresolved generated `any`.
-- [ ] Preserve and report ordinary declaration diagnostics and generated counterfactual diagnostics.
-- [ ] Add tests where parameter types reference a declaration-local alias, interface, class, and imported type.
-- [ ] Confirm neither the implementation source nor declaration source is modified.
+- [x] Include the explicit declaration file and its imported declarations in the virtual analysis program.
+- [x] Validate a relative import-type spelling under NodeNext for module `.d.ts` files without enabling unrelated compiler options.
+- [x] Generate a per-position exported declaration query equivalent to `Parameters<typeof import("<module>").f>[N]`.
+- [x] Implement direct declaration type expressions for ambient-script declarations.
+- [x] Emit each query correctly in TypeScript annotations and JavaScript inline JSDoc.
+- [x] Verify each injected declaration-backed parameter resolves to a non-error checker type; distinguish intentional declared `any` from unresolved generated `any`.
+- [x] Validate declaration diagnostics and preserve generated counterfactual diagnostics.
+- [x] Add tests where parameter types reference a declaration-local interface and imported alias.
+- [x] Confirm neither the implementation source nor declaration source is modified.
 
 ##### 5. Preserve private implementation types
 
-- [ ] For unmatched TypeScript functions, preserve explicit parameter annotations without rewriting them.
-- [ ] For unmatched JavaScript functions, preserve existing inline and function-level JSDoc.
-- [ ] Exercise checker resolution for an unmatched implementation parameter with no explicit annotation and classify the resulting type without guessing from function-body usage.
-- [ ] Label a checker-produced `any` with no explicit source type as `inferred-any`.
-- [ ] Label an explicit implementation `any` as `source-annotation`, not `inferred-any`.
-- [ ] Verify narrowing probes still observe flow-sensitive types when parameters are source-preserved.
+- [x] For unmatched TypeScript functions, preserve explicit parameter annotations without rewriting them.
+- [x] For unmatched JavaScript functions, preserve existing inline and function-level JSDoc.
+- [x] Exercise checker resolution for an unmatched implementation parameter with no explicit annotation and classify the resulting type without guessing from function-body usage.
+- [x] Label a checker-produced `any` with no explicit source type as `inferred-any`.
+- [x] Label an explicit implementation `any` as `source-annotation`, not `inferred-any`.
+- [x] Verify narrowing probes still observe flow-sensitive types when parameters are source-preserved.
 
 ##### 6. Thread the strategy through orchestration
 
-- [ ] Extend `AnalyzeSourceOptions` and `AnalyzeFileOptions` without breaking existing `typeText` callers.
-- [ ] Extend package analysis options in `discovery.ts` and resolve one context for each traversed function.
-- [ ] Extend library analysis options in `library.ts` and reuse one parsed declaration index across all functions.
-- [ ] Preserve runtime-discovered file order and function source order in both modes.
-- [ ] Ensure declaration no-match functions are analyzed successfully with source-preserved types.
-- [ ] Ensure ambiguous/incompatible matches use existing per-function failure isolation in library mode.
-- [ ] Assert uniform and TypeScript-defined modes operate over the identical library function inventory.
+- [x] Extend `AnalyzeSourceOptions` and `AnalyzeFileOptions` without breaking existing `typeText` callers.
+- [x] Extend package analysis options in `discovery.ts` and resolve one context for each traversed function.
+- [x] Extend library analysis options in `library.ts` and reuse one parsed declaration index across all functions.
+- [x] Preserve runtime-discovered file order and function source order in both modes.
+- [x] Ensure declaration no-match functions are analyzed successfully with source-preserved types.
+- [x] Ensure incompatible matches use existing per-function failure isolation in library mode.
+- [x] Assert uniform and TypeScript-defined modes operate over the identical library function inventory.
 
 ##### 7. Add CLI validation and output
 
-- [ ] Add `--decl <path>` to `cli.ts` parsing, usage, and mode forwarding.
-- [ ] Reject `--decl` together with `--type` before discovery or source analysis.
-- [ ] Keep neither-flag behavior equivalent to `--type string`.
-- [ ] Allow `--decl` in file, package, and library modes under their existing positional/mode constraints.
-- [ ] Print uniform results as `T = <type>` with no compatibility regression.
-- [ ] Print TypeScript-defined results with declaration path and per-parameter type-source summaries.
-- [ ] Include strategy, context ID, checked parameter types, origins, and matched declaration identity in JSON.
-- [ ] Return nonzero for invalid declaration files and incompatible matched declarations in requested-function modes; retain clean no-match private fallback and library failure isolation semantics.
+- [x] Add `--decl <path>` to `cli.ts` parsing, usage, and mode forwarding.
+- [x] Reject `--decl` together with `--type` before discovery or source analysis.
+- [x] Keep neither-flag behavior equivalent to `--type string`.
+- [x] Allow `--decl` in file, package, and library modes under their existing positional/mode constraints.
+- [x] Print uniform results as `T = <type>` with no compatibility regression.
+- [x] Print TypeScript-defined results with declaration path and per-parameter type-source summaries.
+- [x] Include strategy, context ID, checked parameter types, origins, and matched declaration identity in JSON.
+- [x] Return nonzero for invalid declaration files and incompatible matched declarations in requested-function modes; retain clean no-match private fallback and library failure isolation semantics.
 
 ##### 8. Protect persistence semantics
 
-- [ ] Reject `--decl` with file/package `--sql` until per-parameter context persistence exists.
-- [ ] Confirm library mode continues to reject `--sql` independently of the new strategy.
-- [ ] Leave the existing uniform `edges.type_text` writes unchanged.
-- [ ] Document the future schema need for context ID plus ordered parameter type/origin records.
+- [x] Reject `--decl` with file/package `--sql` until per-parameter context persistence exists.
+- [x] Confirm library mode continues to reject `--sql` independently of the new strategy.
+- [x] Leave the existing uniform `edges.type_text` writes unchanged.
+- [x] Document the future schema need for context ID plus ordered parameter type/origin records.
 
 ##### 9. Add end-to-end fixtures and tests
 
-- [ ] Create one JavaScript fixture library with a declaration-matched public function, inline-JSDoc private function, function-level-JSDoc private function, and genuinely untyped private function; add a separate TypeScript file fixture for source annotations.
-- [ ] Add positive file-mode tests for distinct declaration parameter types and optional parameters.
-- [ ] Add negative tests for missing/unreadable/non-`.d.ts` files, syntax errors, ambiguous/overloaded declarations, arity mismatch, and declaration rest parameters.
-- [ ] Add CLI mutual-exclusion and no-flag-default tests.
-- [ ] Run the fixture library in uniform and TypeScript-defined modes and compare complete function IDs.
-- [ ] Assert expected parameter types and origins for every fixture function.
-- [ ] Assert context IDs differ for the same function under different parameter vectors and remain stable for identical vectors.
-- [ ] Assert human and JSON summaries agree on analyzed/failed function counts.
+- [x] Cover a fixture library plus focused JavaScript/TypeScript files containing declaration-matched, inline-JSDoc, function-level-JSDoc, source-annotated, explicit-any, and genuinely untyped functions.
+- [x] Add positive file-mode tests for distinct declaration parameter types and optional parameters.
+- [x] Add negative tests for missing/unreadable/non-`.d.ts` files, syntax errors, arity mismatch, and declaration rest parameters; add a positive compatible-overload test.
+- [x] Add CLI mutual-exclusion and no-flag-default tests.
+- [x] Run the fixture library in uniform and TypeScript-defined modes and compare complete function IDs.
+- [x] Assert expected parameter types and origins for every fixture function.
+- [x] Assert context IDs differ for the same function under different parameter vectors and remain stable for identical vectors.
+- [x] Assert human and JSON summaries agree on analyzed/failed function counts.
 
 ##### 10. Integrate and document `js-yaml`
 
-- [ ] Run library mode with explicit `node_modules/@types/js-yaml/index.d.ts`.
-- [ ] Record counts for declaration-matched functions, source-preserved functions, inferred-any parameters, matched-declaration failures, branches, and unreachable edges.
-- [ ] Inspect name collisions where a private function accidentally shares a public declaration name and refine matching if the fixture rules prove insufficient.
-- [ ] Update `README.md` and `tests/README.md` with `--decl`, precedence, private-function fallback, trust/runtime-discovery warnings, and SQLite limitations.
-- [ ] Update the status and measured js-yaml results in this plan after implementation.
+- [x] Run library mode with explicit `node_modules/@types/js-yaml/index.d.ts`.
+- [x] Record counts for declaration-matched functions, source-preserved functions, inferred-any parameters, matched-declaration failures, branches, and unreachable edges.
+- [x] Inspect the three declaration matches (`load`, `loadAll`, and `dump`) for private/public name collisions.
+- [x] Update `README.md` and `tests/README.md` with `--decl`, precedence, private-function fallback, trust/runtime-discovery warnings, and SQLite limitations.
+- [x] Update the status and measured js-yaml results in this plan after implementation.
+
+Current TypeScript-defined js-yaml result:
+
+- 113 functions analyzed with no failures, matching the uniform inventory;
+- 3 functions matched to public declarations and 110 used source-preserved private types;
+- 7 declaration-backed parameters and 199 checker-inferred `any` parameters;
+- 379 branches, 1 parameter-based unreachable edge, 230 diagnostic occurrences, and no unsupported findings.
 
 ##### 11. Verify the completed extension
 
@@ -611,7 +618,7 @@ Complete these groups in order. Keep uniform mode green after each group so the 
 
 - [ ] Omitting both `--type` and `--decl` still analyzes every supported parameter as `string`.
 - [ ] Supplying both flags fails before source analysis with a clear mutual-exclusion error.
-- [ ] `--decl` rejects missing, unreadable, non-`.d.ts`, and syntactically invalid files; ambiguous, overloaded, arity-mismatched, and rest-parameter matches fail that function without falling back to `string`.
+- [x] `--decl` rejects missing, unreadable, non-`.d.ts`, and invalid files; compatible overloads are unioned positionally, while arity-mismatched and rest-parameter matches fail without falling back to `string`.
 - [ ] A declaration with different parameter types applies the correct type to each implementation parameter by position.
 - [ ] Optional declaration parameters retain `undefined` in their configured type.
 - [ ] Parameter types that reference declaration-local aliases, interfaces, classes, or imported declarations resolve in the instrumented program rather than degrading to unresolved `any`.
@@ -704,7 +711,7 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 44 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, library discovery/inventory, `console.table` formatting, SQLite persistence, V8 coverage import, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
+- `index.test.ts`: 51 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, declaration-context, library discovery/inventory, `console.table` formatting, SQLite persistence, V8 coverage import, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
 - `coverage/v8/js-yaml`: five committed raw V8 reports exercised by the coverage-import regression test;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;

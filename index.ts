@@ -1,4 +1,5 @@
 import {createHash} from "node:crypto"
+import {realpathSync} from "node:fs"
 import path from "node:path"
 import ts from "typescript"
 
@@ -11,6 +12,8 @@ export interface AnalyzeSourceOptions {
   functionName: string
   functionPosition?: number
   typeText?: string
+  declarationFile?: string
+  declarationSession?: DeclarationAnalysisSession
   compilerOptions?: ts.CompilerOptions
 }
 
@@ -81,10 +84,41 @@ export interface UnsupportedConstruct {
   reason: string
 }
 
+export type ParameterTypeOrigin =
+  | "uniform-default"
+  | "uniform-explicit"
+  | "declaration"
+  | "source-annotation"
+  | "source-jsdoc"
+  | "inferred"
+  | "inferred-any"
+
+export interface AnalysisInputParameter {
+  name: string
+  type: string
+  origin: ParameterTypeOrigin
+}
+
+export interface MatchedDeclaration {
+  fileName: string
+  functionName: string
+  line: number
+  character: number
+}
+
+export interface AnalysisInput {
+  kind: "uniform" | "declaration"
+  contextId: string
+  declarationFile?: string
+  matchedDeclaration?: MatchedDeclaration
+  parameters: AnalysisInputParameter[]
+}
+
 export interface AnalysisResult {
   fileName: string
   functionName: string
   typeText: string
+  input: AnalysisInput
   branches: BranchResult[]
   diagnostics: AnalysisDiagnostic[]
   unsupported: UnsupportedConstruct[]
@@ -141,6 +175,35 @@ interface ReadProbesResult {
   invalidProbeIds: Set<string>
 }
 
+interface PlannedParameterType {
+  expression?: string
+  origin: ParameterTypeOrigin
+  intentionalAny?: boolean
+}
+
+interface PlannedAnalysisInput {
+  kind: "uniform" | "declaration"
+  declarationFile?: string
+  virtualDeclarationText?: string
+  matchedDeclaration?: MatchedDeclaration
+  parameters: PlannedParameterType[]
+}
+
+interface DeclarationIndex {
+  sourceFile: ts.SourceFile
+  checker: ts.TypeChecker
+  externalModule: boolean
+  functions: Map<string, ts.FunctionDeclaration[]>
+}
+
+export interface DeclarationAnalysisSession {
+  readonly indexes: Map<string, unknown>
+}
+
+export function createDeclarationAnalysisSession(): DeclarationAnalysisSession {
+  return {indexes: new Map()}
+}
+
 /**
  * Entry point.
  */
@@ -158,6 +221,8 @@ export function analyzeFile(options: AnalyzeFileOptions): AnalysisResult {
     functionName: options.functionName,
     functionPosition: options.functionPosition,
     typeText: options.typeText,
+    declarationFile: options.declarationFile,
+    declarationSession: options.declarationSession,
     compilerOptions: {
       ...configured.options,
       ...options.compilerOptions,
@@ -190,7 +255,17 @@ export function getAnalysisTableRows(result: AnalysisResult): AnalysisTableRow[]
 }
 
 export function printAnalysisResult(result: AnalysisResult): void {
-  console.log(`${result.fileName}:${result.functionName} (T = ${result.typeText})`)
+  const input = result.input.kind === "uniform"
+    ? `T = ${result.typeText}`
+    : `types from ${result.input.declarationFile}`
+  console.log(`${result.fileName}:${result.functionName} (${input})`)
+  if (result.input.kind === "declaration" && result.input.parameters.length > 0) {
+    console.table(result.input.parameters.map(parameter => ({
+      parameter: parameter.name,
+      type: parameter.type,
+      source: parameter.origin,
+    })))
+  }
   const rows = getAnalysisTableRows(result)
   if (rows.length > 0) {
     console.table(rows)
@@ -304,6 +379,9 @@ function loadCompilerOptions(
  */
 export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
   const fileName = path.resolve(options.fileName)
+  if (options.typeText !== undefined && options.declarationFile !== undefined) {
+    throw new Error("typeText and declarationFile cannot be used together")
+  }
   const typeText = options.typeText ?? DEFAULT_TYPE_ANNOTATION
   const scriptKind = scriptKindForFile(fileName)
   const isJavaScript = scriptKind === ts.ScriptKind.JS || scriptKind === ts.ScriptKind.JSX
@@ -316,6 +394,7 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     ...(scriptKind === ts.ScriptKind.JSX ? {jsx: ts.JsxEmit.Preserve} : {}),
     ...options.compilerOptions,
     ...(isJavaScript ? {allowJs: true, checkJs: true, noEmit: true} : {}),
+    ...(options.declarationFile === undefined ? {} : {strictNullChecks: true}),
   }
   const originalSource = ts.createSourceFile(
     fileName,
@@ -325,20 +404,43 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     scriptKind,
   )
   const target = findFunction(originalSource, options.functionName, options.functionPosition)
+  const plannedInput = planAnalysisInput(
+    fileName,
+    target,
+    options.typeText,
+    options.declarationFile,
+    options.declarationSession,
+    compilerOptions,
+    isJavaScript,
+  )
   const unsupported: UnsupportedConstruct[] = []
   const edits: TextEdit[] = []
   const parameterNames = planParameterEdits(
     target,
     originalSource,
-    typeText,
+    plannedInput.parameters,
     isJavaScript,
     unsupported,
     edits,
   )
 
   if (parameterNames === undefined) {
-    const originalProgram = createVirtualProgram(fileName, options.sourceText, compilerOptions)
+    const originalProgram = createVirtualProgram(
+      fileName,
+      options.sourceText,
+      compilerOptions,
+      plannedInput.declarationFile === undefined ? [] : [plannedInput.declarationFile],
+      virtualDeclarationFiles(plannedInput),
+    )
     const programSource = originalProgram.getSourceFile(fileName)
+    const input = programSource
+      ? readAnalysisInput(
+          plannedInput,
+          findFunction(programSource, options.functionName, options.functionPosition),
+          originalProgram.getTypeChecker(),
+          fileName,
+        )
+      : emptyAnalysisInput(plannedInput, fileName, target)
     const diagnostics = programSource
       ? ts.getPreEmitDiagnostics(originalProgram, programSource).map(diagnostic =>
           formatDiagnostic(diagnostic, originalSource, [])
@@ -347,7 +449,8 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     return {
       fileName,
       functionName: options.functionName,
-      typeText,
+      typeText: plannedInput.kind === "uniform" ? typeText : "TypeScript-defined",
+      input,
       branches: [],
       diagnostics,
       unsupported,
@@ -369,7 +472,13 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     edits,
   )
   const instrumentedText = applyEdits(options.sourceText, edits)
-  const program = createVirtualProgram(fileName, instrumentedText, compilerOptions)
+  const program = createVirtualProgram(
+    fileName,
+    instrumentedText,
+    compilerOptions,
+    plannedInput.declarationFile === undefined ? [] : [plannedInput.declarationFile],
+    virtualDeclarationFiles(plannedInput),
+  )
   const sourceFile = program.getSourceFile(fileName)
   if (sourceFile === undefined) {
     throw new Error(`TypeScript did not include virtual source ${fileName}`)
@@ -381,6 +490,7 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
     options.functionName,
     options.functionPosition,
   )
+  const input = readAnalysisInput(plannedInput, instrumentedTarget, checker, fileName)
   const parameterSymbols = new Map<string, ts.Symbol>()
   for (const parameter of instrumentedTarget.parameters) {
     if (ts.isIdentifier(parameter.name)) {
@@ -420,7 +530,8 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
   return {
     fileName,
     functionName: options.functionName,
-    typeText,
+    typeText: plannedInput.kind === "uniform" ? typeText : "TypeScript-defined",
+    input,
     branches: branchResults,
     diagnostics,
     unsupported,
@@ -456,18 +567,328 @@ function findFunction(
   return matches[0]
 }
 
+function planAnalysisInput(
+  fileName: string,
+  target: ts.FunctionDeclaration,
+  explicitTypeText: string | undefined,
+  declarationFile: string | undefined,
+  declarationSession: DeclarationAnalysisSession | undefined,
+  compilerOptions: ts.CompilerOptions,
+  isJavaScript: boolean,
+): PlannedAnalysisInput {
+  if (declarationFile === undefined) {
+    const origin: ParameterTypeOrigin = explicitTypeText === undefined
+      ? "uniform-default"
+      : "uniform-explicit"
+    return {
+      kind: "uniform",
+      parameters: target.parameters.map(() => ({
+        expression: explicitTypeText ?? DEFAULT_TYPE_ANNOTATION,
+        origin,
+      })),
+    }
+  }
+
+  if (!declarationFile.endsWith(".d.ts")) {
+    throw new Error(`Declaration file must end with .d.ts: ${declarationFile}`)
+  }
+  let canonicalDeclaration: string
+  try {
+    canonicalDeclaration = realpathSync(path.resolve(declarationFile))
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Could not read declaration file ${path.resolve(declarationFile)}: ${message}`)
+  }
+  const declarationIndex = loadDeclarationIndex(
+    canonicalDeclaration,
+    compilerOptions,
+    declarationSession,
+  )
+  const declarationSource = declarationIndex.sourceFile
+  const externalModule = declarationIndex.externalModule
+  const matches = declarationIndex.functions.get(target.name?.text ?? "") ?? []
+  if (matches.length === 0) {
+    return {
+      kind: "declaration",
+      declarationFile: canonicalDeclaration,
+      parameters: target.parameters.map(parameter => ({
+        origin: sourceParameterOrigin(parameter, isJavaScript),
+      })),
+    }
+  }
+  const declaration = matches[0]
+  if (matches.some(match => match.parameters.length !== target.parameters.length)) {
+    throw new Error(
+      `Declaration ${target.name?.text} overload arity does not match the `
+      + `${target.parameters.length}-parameter implementation`,
+    )
+  }
+  if (matches.some(match =>
+    match.parameters.some(parameter => parameter.dotDotDotToken !== undefined)
+  )) {
+    throw new Error(`Declaration ${target.name?.text} has an unsupported rest parameter`)
+  }
+
+  const moduleSpecifier = externalModule
+    ? declarationModuleSpecifier(fileName, canonicalDeclaration)
+    : undefined
+  let virtualDeclarationText: string | undefined
+  let parameters: PlannedParameterType[]
+  if (matches.length === 1) {
+    parameters = declaration.parameters.map((parameter, index): PlannedParameterType => {
+      let expression: string
+      if (moduleSpecifier !== undefined) {
+        expression = `Parameters<typeof import(${JSON.stringify(moduleSpecifier)}).${target.name!.text}>[${index}]`
+      } else {
+        expression = declarationParameterTypeText(
+          parameter,
+          declarationSource,
+          target.name!.text,
+          index,
+        )
+      }
+      return {
+        expression,
+        origin: "declaration",
+        intentionalAny: declarationTypeIsAny(declarationIndex.checker, parameter),
+      }
+    })
+  } else {
+    const aliasPrefix = `__branch_reachability_${createHash("sha256")
+      .update(`${fileName}:${target.getStart(target.getSourceFile())}:${target.name!.text}`)
+      .digest("hex")
+      .slice(0, 12)}`
+    const aliases = target.parameters.map((_, index) => {
+      const alternatives = [...new Set(matches.map(match => declarationParameterTypeText(
+        match.parameters[index],
+        declarationSource,
+        target.name!.text,
+        index,
+      )))]
+      const union = alternatives.map(alternative => `(${alternative})`).join(" | ")
+      return `${externalModule ? "export " : ""}type ${aliasPrefix}_${index} = ${union}`
+    })
+    virtualDeclarationText = `${declarationSource.text}\n${aliases.join("\n")}\n`
+    parameters = target.parameters.map((_, index) => ({
+      expression: moduleSpecifier === undefined
+        ? `${aliasPrefix}_${index}`
+        : `import(${JSON.stringify(moduleSpecifier)}).${aliasPrefix}_${index}`,
+      origin: "declaration",
+      intentionalAny: matches.some(match =>
+        declarationTypeIsAny(declarationIndex.checker, match.parameters[index])
+      ),
+    }))
+  }
+  const declarationLocation = locationOf(declarationSource, declaration)
+  return {
+    kind: "declaration",
+    declarationFile: canonicalDeclaration,
+    virtualDeclarationText,
+    matchedDeclaration: {
+      fileName: canonicalDeclaration,
+      functionName: target.name!.text,
+      ...declarationLocation,
+    },
+    parameters,
+  }
+}
+
+function declarationTypeIsAny(
+  checker: ts.TypeChecker,
+  parameter: ts.ParameterDeclaration,
+): boolean {
+  return parameter.type !== undefined
+    && (checker.getTypeFromTypeNode(parameter.type).flags & ts.TypeFlags.Any) !== 0
+}
+
+function declarationParameterTypeText(
+  parameter: ts.ParameterDeclaration,
+  sourceFile: ts.SourceFile,
+  functionName: string,
+  index: number,
+): string {
+  if (!parameter.type) {
+    throw new Error(`Declaration ${functionName} parameter ${index + 1} has no type`)
+  }
+  const declared = parameter.type.getText(sourceFile)
+  return parameter.questionToken ? `(${declared}) | undefined` : declared
+}
+
+function loadDeclarationIndex(
+  declarationFile: string,
+  compilerOptions: ts.CompilerOptions,
+  session: DeclarationAnalysisSession | undefined,
+): DeclarationIndex {
+  const cacheKey = `${declarationFile}\0${JSON.stringify(compilerOptions)}`
+  const cached = session?.indexes.get(cacheKey)
+  if (cached !== undefined) {
+    return cached as DeclarationIndex
+  }
+
+  const program = ts.createProgram([declarationFile], {...compilerOptions, skipLibCheck: false})
+  const sourceFile = program.getSourceFile(declarationFile)
+  if (!sourceFile) {
+    throw new Error(`TypeScript did not include declaration file ${declarationFile}`)
+  }
+  const declarationDiagnostics = [
+    ...program.getSyntacticDiagnostics(sourceFile),
+    ...program.getSemanticDiagnostics(sourceFile),
+  ]
+  if (declarationDiagnostics.length > 0) {
+    throw new Error(
+      `Invalid declaration file ${declarationFile}: `
+      + declarationDiagnostics.map(diagnostic =>
+        ts.flattenDiagnosticMessageText(diagnostic.messageText, " ")
+      ).join("; "),
+    )
+  }
+
+  const externalModule = ts.isExternalModule(sourceFile)
+  const functions = new Map<string, ts.FunctionDeclaration[]>()
+  for (const statement of sourceFile.statements) {
+    if (
+      !ts.isFunctionDeclaration(statement)
+      || statement.body !== undefined
+      || !statement.name
+      || (externalModule && !hasExportModifier(statement))
+    ) {
+      continue
+    }
+    const matches = functions.get(statement.name.text) ?? []
+    matches.push(statement)
+    functions.set(statement.name.text, matches)
+  }
+  const index = {sourceFile, checker: program.getTypeChecker(), externalModule, functions}
+  session?.indexes.set(cacheKey, index)
+  return index
+}
+
+function hasExportModifier(node: ts.FunctionDeclaration): boolean {
+  return ts.getModifiers(node)?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword) ?? false
+}
+
+function declarationModuleSpecifier(fileName: string, declarationFile: string): string {
+  const relative = path.relative(path.dirname(fileName), declarationFile).replaceAll(path.sep, "/")
+  return relative.startsWith(".") ? relative : `./${relative}`
+}
+
+function sourceParameterOrigin(
+  parameter: ts.ParameterDeclaration,
+  isJavaScript: boolean,
+): ParameterTypeOrigin {
+  if (parameter.type) {
+    return "source-annotation"
+  }
+  if (
+    isJavaScript
+    && (ts.getJSDocType(parameter) !== undefined || ts.getJSDocParameterTags(parameter).length > 0)
+  ) {
+    return "source-jsdoc"
+  }
+  return "inferred"
+}
+
+function readAnalysisInput(
+  planned: PlannedAnalysisInput,
+  target: ts.FunctionDeclaration,
+  checker: ts.TypeChecker,
+  fileName: string,
+): AnalysisInput {
+  const parameters = target.parameters.map((parameter, index): AnalysisInputParameter => {
+    if (!ts.isIdentifier(parameter.name)) {
+      return {
+        name: parameter.name.getText(),
+        type: "unknown",
+        origin: planned.parameters[index]?.origin ?? "inferred",
+      }
+    }
+    const type = checker.getTypeAtLocation(parameter.name)
+    const originalOrigin = planned.parameters[index]?.origin ?? "inferred"
+    if (
+      originalOrigin === "declaration"
+      && (type.flags & ts.TypeFlags.Any) !== 0
+      && planned.parameters[index]?.intentionalAny !== true
+    ) {
+      throw new Error(
+        `Declaration-backed type for parameter ${parameter.name.text} resolved to unexpected any`,
+      )
+    }
+    return {
+      name: parameter.name.text,
+      type: checker.typeToString(
+        type,
+        parameter.name,
+        ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias,
+      ),
+      origin: originalOrigin === "inferred" && (type.flags & ts.TypeFlags.Any) !== 0
+        ? "inferred-any"
+        : originalOrigin,
+    }
+  })
+  const functionPosition = target.getStart(target.getSourceFile())
+  const contextHash = createHash("sha256")
+    .update(`${path.resolve(fileName)}:${functionPosition}`)
+    .update(JSON.stringify(parameters.map(parameter => parameter.type)))
+    .digest("hex")
+    .slice(0, 16)
+  return {
+    kind: planned.kind,
+    contextId: `context_${contextHash}`,
+    declarationFile: planned.declarationFile,
+    matchedDeclaration: planned.matchedDeclaration,
+    parameters,
+  }
+}
+
+function emptyAnalysisInput(
+  planned: PlannedAnalysisInput,
+  fileName: string,
+  target: ts.FunctionDeclaration,
+): AnalysisInput {
+  const parameters = target.parameters.map((parameter, index) => ({
+    name: parameter.name.getText(),
+    type: planned.parameters[index]?.expression ?? "unknown",
+    origin: planned.parameters[index]?.origin ?? "inferred",
+  }))
+  const contextHash = createHash("sha256")
+    .update(`${path.resolve(fileName)}:${target.getStart(target.getSourceFile())}`)
+    .update(JSON.stringify(parameters.map(parameter => parameter.type)))
+    .digest("hex")
+    .slice(0, 16)
+  return {
+    kind: planned.kind,
+    contextId: `context_${contextHash}`,
+    declarationFile: planned.declarationFile,
+    matchedDeclaration: planned.matchedDeclaration,
+    parameters,
+  }
+}
+
+function virtualDeclarationFiles(input: PlannedAnalysisInput): ReadonlyMap<string, string> {
+  if (input.declarationFile === undefined || input.virtualDeclarationText === undefined) {
+    return new Map()
+  }
+  return new Map([[input.declarationFile, input.virtualDeclarationText]])
+}
+
 function planParameterEdits(
   target: ts.FunctionDeclaration,
   sourceFile: ts.SourceFile,
-  typeText: string,
+  parameterTypes: readonly PlannedParameterType[],
   isJavaScript: boolean,
   unsupported: UnsupportedConstruct[],
   edits?: TextEdit[],
 ): string[] | undefined {
+  if (parameterTypes.length !== target.parameters.length) {
+    throw new Error(
+      `Expected ${target.parameters.length} parameter types, received ${parameterTypes.length}`,
+    )
+  }
   const names: string[] = []
 
-  for (const parameter of target.parameters) {
-    const hasOptionalJSDoc = isJavaScript && ts.getJSDocParameterTags(parameter).some(tag =>
+  for (const [index, parameter] of target.parameters.entries()) {
+    const hasOptionalJSDoc = parameterTypes[index].expression !== undefined
+      && isJavaScript && ts.getJSDocParameterTags(parameter).some(tag =>
       tag.isBracketed
       || tag.typeExpression !== undefined
         && ts.isJSDocOptionalType(tag.typeExpression.type)
@@ -492,13 +913,17 @@ function planParameterEdits(
   }
 
   if (edits) {
-    for (const parameter of target.parameters) {
+    target.parameters.forEach((parameter, index) => {
+      const typeExpression = parameterTypes[index].expression
+      if (typeExpression === undefined) {
+        return
+      }
       const name = parameter.name as ts.Identifier
       if (isJavaScript) {
         edits.push({
           start: name.getStart(sourceFile),
           end: name.getStart(sourceFile),
-          text: `/** @type {${typeText}} */ `,
+          text: `/** @type {${typeExpression}} */ `,
           order: edits.length,
         })
       } else {
@@ -506,11 +931,11 @@ function planParameterEdits(
         edits.push({
           start: name.end,
           end: existingSuffix?.end ?? name.end,
-          text: `: ${typeText}`,
+          text: `: ${typeExpression}`,
           order: edits.length,
         })
       }
-    }
+    })
   }
 
   return names
@@ -706,22 +1131,34 @@ function createVirtualProgram(
   fileName: string,
   sourceText: string,
   compilerOptions: ts.CompilerOptions,
+  additionalRootNames: readonly string[] = [],
+  additionalVirtualFiles: ReadonlyMap<string, string> = new Map(),
 ): ts.Program {
   const defaultHost = ts.createCompilerHost(compilerOptions, true)
-  const isVirtualFile = (candidate: string) => path.resolve(candidate) === fileName
-  const scriptKind = scriptKindForFile(fileName)
+  const virtualFiles = new Map<string, string>([
+    [path.resolve(fileName), sourceText],
+    ...[...additionalVirtualFiles].map(([candidate, text]) => [path.resolve(candidate), text] as const),
+  ])
+  const virtualText = (candidate: string) => virtualFiles.get(path.resolve(candidate))
   const host: ts.CompilerHost = {
     ...defaultHost,
-    fileExists: candidate => isVirtualFile(candidate) || defaultHost.fileExists(candidate),
-    readFile: candidate => isVirtualFile(candidate) ? sourceText : defaultHost.readFile(candidate),
+    fileExists: candidate => virtualText(candidate) !== undefined || defaultHost.fileExists(candidate),
+    readFile: candidate => virtualText(candidate) ?? defaultHost.readFile(candidate),
     getSourceFile: (candidate, languageVersion, onError, shouldCreateNewSourceFile) => {
-      if (isVirtualFile(candidate)) {
-        return ts.createSourceFile(candidate, sourceText, languageVersion, true, scriptKind)
+      const text = virtualText(candidate)
+      if (text !== undefined) {
+        return ts.createSourceFile(
+          candidate,
+          text,
+          languageVersion,
+          true,
+          scriptKindForFile(candidate),
+        )
       }
       return defaultHost.getSourceFile(candidate, languageVersion, onError, shouldCreateNewSourceFile)
     },
   }
-  return ts.createProgram([fileName], compilerOptions, host)
+  return ts.createProgram([fileName, ...additionalRootNames], compilerOptions, host)
 }
 
 function scriptKindForFile(fileName: string): ts.ScriptKind {
@@ -779,7 +1216,14 @@ function readProbeTypes(
         }
         const type = checker.getTypeAtLocation(element)
         types.set(name, type)
-        strings.set(name, checker.typeToString(type, element, ts.TypeFormatFlags.NoTruncation))
+        strings.set(
+          name,
+          checker.typeToString(
+            type,
+            element,
+            ts.TypeFormatFlags.NoTruncation | ts.TypeFormatFlags.InTypeAlias,
+          ),
+        )
       })
       probes.set(id, {types, strings})
     }

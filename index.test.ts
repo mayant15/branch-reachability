@@ -31,6 +31,34 @@ function analyzeJavaScript(sourceText: string, typeText = "string") {
   })
 }
 
+test("records default and explicit uniform input origins without changing context identity", () => {
+  const sourceText = `function target(value) {
+  if (typeof value === "number") return value
+}`
+  const defaultInput = analyzeSource({
+    fileName: "/virtual/uniform.ts",
+    sourceText,
+    functionName: "target",
+  })
+  const explicitInput = analyzeSource({
+    fileName: "/virtual/uniform.ts",
+    sourceText,
+    functionName: "target",
+    typeText: "string",
+  })
+  const differentInput = analyzeSource({
+    fileName: "/virtual/uniform.ts",
+    sourceText,
+    functionName: "target",
+    typeText: "number",
+  })
+
+  assert.equal(defaultInput.input.parameters[0].origin, "uniform-default")
+  assert.equal(explicitInput.input.parameters[0].origin, "uniform-explicit")
+  assert.equal(defaultInput.input.contextId, explicitInput.input.contextId)
+  assert.notEqual(defaultInput.input.contextId, differentInput.input.contextId)
+})
+
 test("overrides an existing annotation and detects a never true edge", () => {
   const source = `
 function target(value: number) {
@@ -402,6 +430,227 @@ function target(/** @type {boolean} */ value) {
   assert.equal(result.branches[0].edges[0].classification, "newly-unreachable")
 })
 
+test("uses distinct parameter types from an explicit declaration file", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-decl-"))
+  try {
+    const fileName = path.join(directory, "implementation.js")
+    const declarationFile = path.join(directory, "types.d.ts")
+    const source = `function target(value, options) {
+  if (typeof value === "number") return options
+  return value
+}
+`
+    writeFileSync(fileName, source)
+    writeFileSync(declarationFile, `
+import type {Shared} from "./shared.js"
+export interface Options {kind: "strict"}
+export function target(value: Shared, options?: Options): unknown
+`)
+    writeFileSync(path.join(directory, "shared.d.ts"), "export type Shared = string\n")
+
+    const result = analyzeFile({
+      fileName,
+      functionName: "target",
+      declarationFile,
+      tsconfig: false,
+    })
+
+    assert.equal(result.input.kind, "declaration")
+    assert.deepEqual(result.input.parameters, [{
+      name: "value",
+      type: "string",
+      origin: "declaration",
+    }, {
+      name: "options",
+      type: 'import("./types.d.ts").Options | undefined',
+      origin: "declaration",
+    }])
+    assert.equal(result.input.matchedDeclaration?.line, 4)
+    assert.equal(result.branches[0].edges[0].classification, "newly-unreachable")
+    assert.equal(readFileSync(fileName, "utf8"), source)
+    assert.match(readFileSync(declarationFile, "utf8"), /interface Options/)
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("resolves declaration imports for NodeNext ESM source extensions", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-decl-esm-"))
+  try {
+    const declarationFile = path.join(directory, "types.d.ts")
+    writeFileSync(declarationFile, "export function target(value: string): unknown\n")
+    for (const extension of [".mjs", ".mts"]) {
+      const fileName = path.join(directory, `implementation${extension}`)
+      writeFileSync(fileName, `export function target(value) {
+  if (typeof value === "number") return value
+}
+`)
+      const result = analyzeFile({
+        fileName,
+        functionName: "target",
+        declarationFile,
+        tsconfig: false,
+      })
+      assert.equal(result.input.parameters[0].type, "string")
+      assert.equal(result.diagnostics.some(diagnostic => diagnostic.code === 2834), false)
+    }
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("declaration mode preserves private implementation types", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-decl-private-"))
+  try {
+    const declarationFile = path.join(directory, "types.d.ts")
+    writeFileSync(declarationFile, "export function publicFunction(value: string): void\n")
+    const jsFile = path.join(directory, "private.js")
+    writeFileSync(jsFile, `
+/** @param {number} value */
+function privateFunction(value) {
+  if (typeof value === "string") return value
+}
+function untyped(value) {
+  if (typeof value === "string") return value
+}
+function inline(/** @type {boolean} */ value) {
+  if (typeof value === "string") return value
+}
+`)
+    const typed = analyzeFile({
+      fileName: jsFile,
+      functionName: "privateFunction",
+      declarationFile,
+      tsconfig: false,
+    })
+    const untyped = analyzeFile({
+      fileName: jsFile,
+      functionName: "untyped",
+      declarationFile,
+      tsconfig: false,
+    })
+    const inline = analyzeFile({
+      fileName: jsFile,
+      functionName: "inline",
+      declarationFile,
+      tsconfig: false,
+    })
+
+    assert.deepEqual(typed.input.parameters, [{
+      name: "value",
+      type: "number",
+      origin: "source-jsdoc",
+    }])
+    assert.equal(typed.branches[0].edges[0].classification, "newly-unreachable")
+    assert.deepEqual(untyped.input.parameters, [{
+      name: "value",
+      type: "any",
+      origin: "inferred-any",
+    }])
+    assert.deepEqual(inline.input.parameters, [{
+      name: "value",
+      type: "boolean",
+      origin: "source-jsdoc",
+    }])
+
+    const tsFile = path.join(directory, "private.ts")
+    writeFileSync(tsFile, `function privateFunction(value: boolean) {
+  if (typeof value === "string") return value
+}
+function explicitAny(value: any) {
+  if (typeof value === "string") return value
+}
+`)
+    const annotated = analyzeFile({
+      fileName: tsFile,
+      functionName: "privateFunction",
+      declarationFile,
+      tsconfig: false,
+    })
+    assert.deepEqual(annotated.input.parameters, [{
+      name: "value",
+      type: "boolean",
+      origin: "source-annotation",
+    }])
+    const explicitAny = analyzeFile({
+      fileName: tsFile,
+      functionName: "explicitAny",
+      declarationFile,
+      tsconfig: false,
+    })
+    assert.deepEqual(explicitAny.input.parameters, [{
+      name: "value",
+      type: "any",
+      origin: "source-annotation",
+    }])
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("validates declaration files and matched parameter shapes", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-decl-errors-"))
+  try {
+    const fileName = path.join(directory, "implementation.js")
+    writeFileSync(fileName, "function target(value) { return value }\n")
+    const analyzeWith = (declarationFile: string) => analyzeFile({
+      fileName,
+      functionName: "target",
+      declarationFile,
+      tsconfig: false,
+    })
+
+    assert.throws(() => analyzeWith(path.join(directory, "missing.d.ts")), /Could not read/)
+    const wrongExtension = path.join(directory, "types.ts")
+    writeFileSync(wrongExtension, "export function target(value: string): string\n")
+    assert.throws(() => analyzeWith(wrongExtension), /must end with \.d\.ts/)
+    const invalid = path.join(directory, "invalid.d.ts")
+    writeFileSync(invalid, "export function target(value: ): void\n")
+    assert.throws(() => analyzeWith(invalid), /Invalid declaration file/)
+    const arity = path.join(directory, "arity.d.ts")
+    writeFileSync(arity, "export function target(value: string, other: number): void\n")
+    assert.throws(() => analyzeWith(arity), /arity does not match/)
+    const rest = path.join(directory, "rest.d.ts")
+    writeFileSync(rest, "export function target(...value: string[]): void\n")
+    assert.throws(() => analyzeWith(rest), /unsupported rest parameter/)
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("unions compatible declaration overload parameter types", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-decl-invalid-"))
+  try {
+    const fileName = path.join(directory, "implementation.js")
+    const declarationFile = path.join(directory, "types.d.ts")
+    writeFileSync(fileName, "function target(value) { return value }\n")
+    writeFileSync(declarationFile, `
+export function target(value: () => string): string
+export function target(value: number): number
+`)
+
+    const overloaded = analyzeFile({
+      fileName,
+      functionName: "target",
+      declarationFile,
+      tsconfig: false,
+    })
+    assert.equal(overloaded.input.parameters[0].origin, "declaration")
+    assert.match(overloaded.input.parameters[0].type, /number/)
+    assert.match(overloaded.input.parameters[0].type, /\(\) => string/)
+    assert.equal(overloaded.diagnostics.some(diagnostic => diagnostic.code === 1385), false)
+    assert.throws(() => analyzeFile({
+      fileName,
+      functionName: "target",
+      typeText: "string",
+      declarationFile,
+      tsconfig: false,
+    }), /cannot be used together/)
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
 test("rejects optional JSDoc parameters instead of retaining undefined", () => {
   for (const annotation of [
     "/** @param {number} [value] */",
@@ -715,6 +964,37 @@ module.exports = entryPoint
       diagnosticOccurrences: 0,
       unsupported: 0,
     })
+    assert.equal(result.files.every(file => file.functions.every(fn =>
+      fn.status === "analyzed"
+      && fn.analysis.input.parameters.every(parameter =>
+        parameter.origin === "uniform-default"
+      )
+    )), true)
+
+    const declarationFile = path.join(directory, "index.d.ts")
+    writeFileSync(
+      declarationFile,
+      "export function entryPoint(value: string): string | null\n",
+    )
+    const declared = analyzeLibrary({entryFile, declarationFile})
+    assert.deepEqual(
+      declared.files.flatMap(file => file.functions.map(fn => fn.id)),
+      result.files.flatMap(file => file.functions.map(fn => fn.id)),
+    )
+    assert.equal(declared.summary.analyzedFunctions, 3)
+    const declaredFunctions = declared.files.flatMap(file => file.functions)
+    const entryPoint = declaredFunctions.find(fn => fn.functionName === "entryPoint")
+    const helper = declaredFunctions.find(fn => fn.functionName === "helper")
+    assert.equal(entryPoint?.status, "analyzed")
+    assert.equal(
+      entryPoint?.status === "analyzed" ? entryPoint.analysis.input.parameters[0].origin : "",
+      "declaration",
+    )
+    assert.equal(helper?.status, "analyzed")
+    assert.equal(
+      helper?.status === "analyzed" ? helper.analysis.input.parameters[0].origin : "",
+      "inferred-any",
+    )
 
     const execution = spawnSync(
       process.execPath,
@@ -1084,6 +1364,68 @@ test("CLI emits structured JSON", () => {
     const result = JSON.parse(execution.stdout)
     assert.equal(result.functionName, "target")
     assert.equal(result.branches[0].edges[0].classification, "newly-unreachable")
+  } finally {
+    rmSync(directory, {recursive: true, force: true})
+  }
+})
+
+test("CLI accepts --decl and rejects conflicting type input", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "branch-reachability-cli-decl-"))
+  try {
+    const fileName = path.join(directory, "fixture.js")
+    const declarationFile = path.join(directory, "fixture.d.ts")
+    writeFileSync(fileName, `function target(value) {
+  if (typeof value === "number") return value
+}
+`)
+    writeFileSync(declarationFile, "export function target(value: string): unknown\n")
+    const execution = spawnSync(
+      process.execPath,
+      ["cli.ts", "--decl", declarationFile, "--json", fileName, "target"],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+
+    assert.equal(execution.status, 0, execution.stderr)
+    const result = JSON.parse(execution.stdout) as {
+      input: {kind: string; parameters: Array<{type: string; origin: string}>}
+    }
+    assert.equal(result.input.kind, "declaration")
+    assert.deepEqual(result.input.parameters, [{
+      name: "value",
+      type: "string",
+      origin: "declaration",
+    }])
+
+    const conflict = spawnSync(
+      process.execPath,
+      ["cli.ts", "--decl", declarationFile, "--type", "number", fileName, "target"],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+    assert.equal(conflict.status, 1)
+    assert.match(conflict.stderr, /--type and --decl cannot be used together/)
+
+    const explicitUnion = spawnSync(
+      process.execPath,
+      ["cli.ts", "--type", "string | number", "--json", fileName, "target"],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+    assert.equal(explicitUnion.status, 0, explicitUnion.stderr)
+    const unionResult = JSON.parse(explicitUnion.stdout) as {
+      input: {parameters: Array<{type: string; origin: string}>}
+    }
+    assert.deepEqual(unionResult.input.parameters, [{
+      name: "value",
+      type: "string | number",
+      origin: "uniform-explicit",
+    }])
+
+    const sqlConflict = spawnSync(
+      process.execPath,
+      ["cli.ts", "--decl", declarationFile, "--sql", path.join(directory, "x.db"), fileName, "target"],
+      {cwd: path.resolve("."), encoding: "utf8"},
+    )
+    assert.equal(sqlConflict.status, 1)
+    assert.match(sqlConflict.stderr, /--decl cannot be combined with --sql/)
   } finally {
     rmSync(directory, {recursive: true, force: true})
   }

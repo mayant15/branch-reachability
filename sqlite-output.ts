@@ -6,6 +6,9 @@ export function writeAnalysesToSqlite(
   databasePath: string,
   analyses: readonly AnalysisResult[],
 ): string {
+  if (analyses.some(analysis => analysis.input.kind === "declaration")) {
+    throw new Error("SQLite output does not yet support declaration-backed parameter types")
+  }
   const resolvedPath = path.resolve(databasePath)
   const database = new DatabaseSync(resolvedPath)
   try {

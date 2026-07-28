@@ -105,6 +105,25 @@ to override the nearest-package root. This prototype executes the entry point
 without a sandbox and intentionally does not discover ESM, asynchronous loads,
 nested functions, arrows, methods, or function expressions.
 
+### TypeScript-defined parameter types
+
+Pass an explicit declaration file to use its positional parameter types for
+matching functions. Functions absent from the declaration file are treated as
+private: their existing TypeScript annotations or JavaScript JSDoc are preserved,
+and genuinely untyped parameters remain `any`.
+
+```sh
+npm run analyze -- \
+  --library node_modules/js-yaml/index.js \
+  --decl node_modules/@types/js-yaml/index.d.ts
+```
+
+`--decl` also works in file and package modes. It is mutually exclusive with
+`--type`. Overload parameter types are unioned positionally when every overload
+has the implementation's arity. JSON output records each parameter's checked
+type and origin (`declaration`, `source-annotation`, `source-jsdoc`, or
+`inferred-any`). Declaration-backed results cannot yet be written with `--sql`.
+
 ## SQLite output
 
 Persist the same edge rows shown by `console.table` into an `edges` table. Re-running an analysis updates rows with the same location-derived `edge_id`.

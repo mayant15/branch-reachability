@@ -3,6 +3,7 @@ import path from "node:path"
 import ts from "typescript"
 import {
   analyzeFile,
+  createDeclarationAnalysisSession,
   type AnalysisResult,
 } from "./index.ts"
 
@@ -10,6 +11,7 @@ export interface AnalyzePackageExportOptions {
   packageName: string
   exportName: string
   typeText?: string
+  declarationFile?: string
   compilerOptions?: ts.CompilerOptions
   maxDepth?: number
   maxFunctions?: number
@@ -84,6 +86,9 @@ interface DirectCalls {
 export function analyzePackageExport(
   options: AnalyzePackageExportOptions,
 ): PackageAnalysisResult {
+  if (options.typeText !== undefined && options.declarationFile !== undefined) {
+    throw new Error("typeText and declarationFile cannot be used together")
+  }
   const maxDepth = options.maxDepth ?? 3
   const maxFunctions = options.maxFunctions ?? 50
   if (!Number.isInteger(maxDepth) || maxDepth < 0) {
@@ -114,6 +119,9 @@ export function analyzePackageExport(
     new Set(),
   )
   const functions: DiscoveredFunctionResult[] = []
+  const declarationSession = options.declarationFile === undefined
+    ? undefined
+    : createDeclarationAnalysisSession()
   const unresolvedCalls: UnresolvedCall[] = []
   const truncated: TruncatedFunction[] = []
   const visited = new Set<string>()
@@ -144,6 +152,8 @@ export function analyzePackageExport(
       functionName,
       functionPosition: current.declaration.getStart(current.sourceFile),
       typeText: options.typeText,
+      declarationFile: options.declarationFile,
+      declarationSession,
       compilerOptions: options.compilerOptions,
       tsconfig: false,
     })

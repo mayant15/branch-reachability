@@ -13,6 +13,7 @@ Analyze TypeScript narrowing for one function.
 
 Options:
   --type <type>       Override every parameter with this type (default: string)
+  --decl <path>       Use declared types and preserve types of unmatched private functions
   --project <path>    Use this tsconfig.json instead of searching parent directories
   --no-project        Do not load a tsconfig.json
   --package <name>    Resolve a package through Node's require condition
@@ -31,6 +32,7 @@ try {
     strict: true,
     options: {
       type: {type: "string"},
+      decl: {type: "string"},
       project: {type: "string"},
       "no-project": {type: "boolean"},
       package: {type: "string"},
@@ -48,6 +50,10 @@ try {
   if (parsed.values.help) {
     console.log(usage)
     process.exitCode = 0
+  } else if (parsed.values.type && parsed.values.decl) {
+    throw new Error("--type and --decl cannot be used together")
+  } else if (parsed.values.decl && parsed.values.sql) {
+    throw new Error("--decl cannot be combined with --sql")
   } else if (parsed.values.project && parsed.values["no-project"]) {
     throw new Error("--project and --no-project cannot be used together")
   } else if (parsed.values.library) {
@@ -69,6 +75,7 @@ try {
       entryFile: parsed.values.library,
       libraryRoot: parsed.values["library-root"],
       typeText: parsed.values.type,
+      declarationFile: parsed.values.decl,
     })
     if (parsed.values.json) {
       console.log(JSON.stringify(result, null, 2))
@@ -91,6 +98,7 @@ try {
       packageName: parsed.values.package,
       exportName: parsed.values.export,
       typeText: parsed.values.type,
+      declarationFile: parsed.values.decl,
       maxDepth: parseIntegerOption("--max-depth", parsed.values["max-depth"]),
       maxFunctions: parseIntegerOption("--max-functions", parsed.values["max-functions"]),
     })
@@ -118,6 +126,7 @@ try {
       fileName,
       functionName,
       typeText: parsed.values.type,
+      declarationFile: parsed.values.decl,
       tsconfig: parsed.values["no-project"] ? false : parsed.values.project,
     })
     if (parsed.values.sql) {
