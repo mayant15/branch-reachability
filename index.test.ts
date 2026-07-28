@@ -115,6 +115,126 @@ function target(value, other: boolean) {
   assert.deepEqual(trueEdge.parameters.map(parameter => parameter.name), ["value", "other"])
   assert.deepEqual(trueEdge.parameters.map(parameter => parameter.baselineType), ["string", "string"])
   assert.deepEqual(trueEdge.parameters.map(parameter => parameter.edgeType), ["never", "string"])
+  assert.deepEqual(trueEdge.parameters.map(parameter => parameter.entryProbability), [0, 1])
+  assert.equal(trueEdge.entryProbability, 0)
+})
+
+test("computes entry probability from union type narrowing", () => {
+  const result = analyze(`
+type Shape = {kind: "circle"; radius: number} | {kind: "square"; side: number}
+function target(value: Shape) {
+  if (value.kind === "circle") {
+    console.log(value)
+  } else {
+    console.log(value)
+  }
+}
+`, "Shape")
+  const branch = result.branches[0]
+  assert.equal(branch.edges[0].edge, "true")
+  assert.equal(branch.edges[0].classification, "reachable")
+  assert.equal(branch.edges[0].entryProbability, 0.5)
+  assert.equal(branch.edges[1].edge, "false")
+  assert.equal(branch.edges[1].classification, "reachable")
+  assert.equal(branch.edges[1].entryProbability, 0.5)
+})
+
+test("probFromFnEntry is the cumulative product along the enclosing edge chain", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "string") {
+    if (typeof value === "number") {
+      console.log(value)
+    } else {
+      console.log(value)
+    }
+  }
+}
+`)
+  const [outer, inner] = result.branches
+  const outerTrue = outer.edges.find(e => e.edge === "true")!
+  const outerFalse = outer.edges.find(e => e.edge === "false")!
+  assert.equal(outerTrue.classification, "reachable")
+  assert.equal(outerFalse.classification, "newly-unreachable")
+  assert.equal(outerTrue.entryProbability, 1)
+  assert.equal(outerTrue.probFromFnEntry, 1)
+  assert.equal(outerFalse.entryProbability, 0)
+  assert.equal(outerFalse.probFromFnEntry, 0)
+
+  const innerTrue = inner.edges.find(e => e.edge === "true")!
+  const innerFalse = inner.edges.find(e => e.edge === "false")!
+  assert.equal(innerTrue.classification, "newly-unreachable")
+  assert.equal(innerFalse.classification, "reachable")
+  assert.equal(innerTrue.entryProbability, 0)
+  assert.equal(innerTrue.probFromFnEntry, 0)
+  assert.equal(innerFalse.entryProbability, 1)
+  assert.equal(innerFalse.probFromFnEntry, 1)
+
+  const rows = getAnalysisTableRows(result)
+  const innerFalseRow = rows.find(r => r.edge_id === innerFalse.edgeId)!
+  assert.equal(innerFalseRow.prob_from_fn_entry, 1)
+})
+
+test("probFromFnEntry multiplies through multiple nesting levels", () => {
+  const result = analyze(`
+function target(a: "x" | "y" | "z") {
+  if (a === "x") {
+    if (a === "y") {
+      console.log(a)
+    }
+  }
+}
+`, `"x" | "y" | "z"`)
+  const outer = result.branches[0]
+  const inner = result.branches[1]
+  const outerTrue = outer.edges.find(e => e.edge === "true")!
+  assert.equal(outerTrue.entryProbability, 1 / 3)
+  assert.equal(outerTrue.probFromFnEntry, 1 / 3)
+
+  const innerTrue = inner.edges.find(e => e.edge === "true")!
+  assert.equal(innerTrue.entryProbability, 0)
+  assert.equal(innerTrue.probFromFnEntry, 0)
+})
+
+test("entry probability reflects constituent ratio for boolean narrowing", () => {
+  const result = analyze(`
+function target(value: boolean) {
+  if (value) {
+    console.log(value)
+  } else {
+    console.log(value)
+  }
+}
+`, "boolean")
+  const branch = result.branches[0]
+
+  assert.equal(branch.edges[0].edge, "true")
+  assert.equal(branch.edges[1].edge, "false")
+  assert.equal(branch.edges[0].classification, "reachable")
+  assert.equal(branch.edges[1].classification, "reachable")
+  assert.equal(branch.edges[0].entryProbability, 0.5)
+  assert.equal(branch.edges[1].entryProbability, 0.5)
+  assert.equal(
+    branch.edges[0].parameters[0].baselineType,
+    branch.edges[1].parameters[0].baselineType,
+  )
+})
+
+test("entry probability is 1 for inherited-unreachable edges", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "number") {
+    if (value === 1) {
+      console.log(value)
+    }
+  }
+}
+`)
+  const inner = result.branches.find(branch => branch.condition === "value === 1")!
+  assert.equal(inner.edges[0].classification, "inherited-unreachable")
+  assert.equal(inner.edges[0].entryProbability, 1)
+  assert.equal(inner.edges[1].classification, "inherited-unreachable")
+  assert.equal(inner.edges[1].entryProbability, 1)
 })
 
 test("classifies nested branches below an impossible edge as inherited unreachable", () => {
@@ -1044,17 +1164,24 @@ function target(value) {
 
   assert.equal(rows.length, 3)
   assert.deepEqual(Object.keys(rows[0]), [
-    "edge_id", "edge", "classification",
+    "edge_id", "edge", "classification", "entry_probability", "prob_from_fn_entry",
     "start_line", "start_col", "end_line", "end_col",
     "start_offset", "end_offset", "probed_types", "parent_edge_id",
   ])
   assert.match(rows[0].edge_id, /^edge_[a-f0-9]{16}$/)
   assert.equal(rows[0].edge, "baseline")
+  assert.equal(rows[0].entry_probability, 1)
+  assert.equal(rows[0].prob_from_fn_entry, 1)
   assert.equal(rows[0].start_line, 3)
   assert.equal(rows[1].edge, "true")
   assert.equal(rows[1].classification, "newly-unreachable")
+  assert.equal(rows[1].entry_probability, 0)
+  assert.equal(rows[1].prob_from_fn_entry, 0)
   assert.equal(rows[1].probed_types, "value: never")
   assert.equal(rows[1].parent_edge_id, rows[0].edge_id)
+  assert.equal(rows[2].edge, "false")
+  assert.equal(rows[2].entry_probability, 1)
+  assert.equal(rows[2].prob_from_fn_entry, 1)
 })
 
 test("CLI uses console.table for human output", () => {
@@ -1286,12 +1413,46 @@ test("assigns stable location IDs and baseline parents to edge rows", () => {
   const rowsById = new Map(rows.map(row => [row.edge_id, row]))
   for (const row of rows) {
     if (row.edge === "baseline") {
-      assert.equal(row.parent_edge_id, "")
+      if (row.parent_edge_id === "") {
+        // root baseline — no enclosing edge, valid
+      } else {
+        // nested baseline — parent must be a true/false edge
+        assert.ok(rowsById.get(row.parent_edge_id))
+        assert.notEqual(rowsById.get(row.parent_edge_id)?.edge, "baseline")
+      }
     } else {
       assert.notEqual(row.parent_edge_id, "")
       assert.equal(rowsById.get(row.parent_edge_id)?.edge, "baseline")
     }
   }
+})
+
+test("nested baseline parentEdgeId points to the enclosing edge", () => {
+  const result = analyze(`
+function target(value) {
+  if (typeof value === "string") {
+    if (typeof value === "number") {
+      console.log(value)
+    }
+  }
+}
+`)
+  const [outer, inner] = result.branches
+  assert.equal(outer.baseline.parentEdgeId, null)
+
+  const outerTrueEdge = outer.edges.find(edge => edge.edge === "true")!
+  assert.equal(inner.baseline.parentEdgeId, outerTrueEdge.edgeId)
+
+  const rows = getAnalysisTableRows(result)
+  const rowsById = new Map(rows.map(row => [row.edge_id, row]))
+  const innerBaselineRow = rows.find(row =>
+    row.edge === "baseline" && row.edge_id === inner.baseline.edgeId
+  )!
+  assert.notEqual(innerBaselineRow.parent_edge_id, "")
+  assert.equal(
+    rowsById.get(innerBaselineRow.parent_edge_id)?.edge,
+    "true",
+  )
 })
 
 test("analyzeFile loads the nearest tsconfig and leaves the source unchanged", () => {
@@ -1429,4 +1590,87 @@ test("CLI accepts --decl and rejects conflicting type input", () => {
   } finally {
     rmSync(directory, {recursive: true, force: true})
   }
+})
+
+function assertProbabilitiesInBounds(result: ReturnType<typeof analyze>) {
+  for (const branch of result.branches) {
+    for (const edge of branch.edges) {
+      assert.ok(
+        edge.entryProbability >= 0 && edge.entryProbability <= 1,
+        `entryProbability ${edge.entryProbability} out of bounds for ${edge.edgeId}`,
+      )
+      assert.ok(
+        edge.probFromFnEntry >= 0 && edge.probFromFnEntry <= 1,
+        `probFromFnEntry ${edge.probFromFnEntry} out of bounds for ${edge.edgeId}`,
+      )
+      for (const param of edge.parameters) {
+        assert.ok(
+          param.entryProbability >= 0 && param.entryProbability <= 1,
+          `parameter entryProbability ${param.entryProbability} out of bounds for ${param.name} in ${edge.edgeId}`,
+        )
+      }
+    }
+  }
+}
+
+test("all probabilities are in [0,1] for reachable and unreachable edges", () => {
+  assertProbabilitiesInBounds(analyze(`
+function target(value) {
+  if (typeof value === "number") {
+    console.log(value)
+  } else {
+    console.log(value)
+  }
+}
+`))
+})
+
+test("all probabilities are in [0,1] for nested narrowing", () => {
+  assertProbabilitiesInBounds(analyze(`
+function target(value) {
+  if (typeof value === "string") {
+    if (typeof value === "number") {
+      console.log(value)
+    }
+  }
+}
+`))
+})
+
+test("all probabilities are in [0,1] for else-if chains", () => {
+  assertProbabilitiesInBounds(analyze(`
+function target(value) {
+  if (typeof value === "number") {
+    return "number"
+  } else if (typeof value === "boolean") {
+    return "boolean"
+  } else {
+    return "string"
+  }
+}
+`))
+})
+
+test("all probabilities are in [0,1] for union narrowing", () => {
+  assertProbabilitiesInBounds(analyze(`
+function target(value: "a" | "b" | "c") {
+  if (value === "a") {
+    console.log(value)
+  } else if (value === "b") {
+    console.log(value)
+  }
+}
+`, `"a" | "b" | "c"`))
+})
+
+test("all probabilities are in [0,1] for inherited-unreachable with multiple params", () => {
+  assertProbabilitiesInBounds(analyze(`
+function target(first, second) {
+  if (typeof first === "number") {
+    if (typeof second === "number") {
+      console.log(first, second)
+    }
+  }
+}
+`))
 })

@@ -50,11 +50,16 @@ function runAndSave(
   writeAnalysesToSqlite(dbPath, collectAnalyses(result))
   const db = new DatabaseSync(dbPath)
   db.exec(`
-    CREATE TABLE IF NOT EXISTS library_summary (
-      library_name TEXT, type_text TEXT,
-      files INTEGER, analyzed INTEGER, failed INTEGER, branches INTEGER,
-      unreachable_edges INTEGER, diagnostics INTEGER, unsupported INTEGER
-    )
+      CREATE TABLE IF NOT EXISTS library_summary (
+        library_name TEXT NOT NULL, type_text TEXT NOT NULL,
+        files INTEGER NOT NULL CHECK (files >= 0),
+        analyzed INTEGER NOT NULL CHECK (analyzed >= 0),
+        failed INTEGER NOT NULL CHECK (failed >= 0),
+        branches INTEGER NOT NULL CHECK (branches >= 0),
+        unreachable_edges INTEGER NOT NULL CHECK (unreachable_edges >= 0),
+        diagnostics INTEGER NOT NULL CHECK (diagnostics >= 0),
+        unsupported INTEGER NOT NULL CHECK (unsupported >= 0)
+      )
   `)
   db.prepare(
     "INSERT INTO library_summary VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

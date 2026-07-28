@@ -31,6 +31,7 @@ export interface ParameterResult {
   baselineType: string
   edgeType: string
   classification: ParameterClassification
+  entryProbability: number
 }
 
 export interface SourcePosition {
@@ -49,7 +50,7 @@ export interface BaselineResult {
   edge: "baseline"
   location: SourceSpan
   probedTypes: Array<{name: string; type: string}>
-  parentEdgeId: null
+  parentEdgeId: string | null
 }
 
 export interface EdgeResult {
@@ -58,6 +59,8 @@ export interface EdgeResult {
   location: SourceSpan
   parentEdgeId: string
   classification: ParameterClassification
+  entryProbability: number
+  probFromFnEntry: number
   parameters: ParameterResult[]
 }
 
@@ -128,6 +131,8 @@ export interface AnalysisTableRow {
   edge_id: string
   edge: "baseline" | "true" | "false"
   classification: "" | ParameterClassification
+  entry_probability: number
+  prob_from_fn_entry: number
   start_line: number
   start_col: number
   end_line: number
@@ -162,6 +167,7 @@ interface PlannedBranch {
   character: number
   condition: string
   baseline: ProbeMetadata
+  parentEdgeId: string | null
   edges: PlannedEdge[]
 }
 
@@ -239,6 +245,8 @@ export function getAnalysisTableRows(result: AnalysisResult): AnalysisTableRow[]
       branch.baseline.edgeId,
       branch.baseline.edge,
       "",
+      1,
+      1,
       branch.baseline.location,
       branch.baseline.probedTypes,
       branch.baseline.parentEdgeId,
@@ -247,6 +255,8 @@ export function getAnalysisTableRows(result: AnalysisResult): AnalysisTableRow[]
       edge.edgeId,
       edge.edge,
       edge.classification,
+      edge.entryProbability,
+      edge.probFromFnEntry,
       edge.location,
       edge.parameters.map(parameter => ({name: parameter.name, type: parameter.edgeType})),
       edge.parentEdgeId,
@@ -318,6 +328,8 @@ function toAnalysisTableRow(
   edgeId: string,
   edge: "baseline" | "true" | "false",
   classification: "" | ParameterClassification,
+  entryProbability: number,
+  probFromFnEntry: number,
   location: SourceSpan,
   probedTypes: Array<{name: string; type: string}>,
   parentEdgeId: string | null,
@@ -330,6 +342,8 @@ function toAnalysisTableRow(
     edge_id: edgeId,
     edge,
     classification,
+    entry_probability: entryProbability,
+    prob_from_fn_entry: probFromFnEntry,
     start_line: location.start.line,
     start_col: location.start.character,
     end_line: location.end.line,
@@ -523,6 +537,23 @@ export function analyzeSource(options: AnalyzeSourceOptions): AnalysisResult {
       branchResults.push(classifyBranch(branch, probes))
     }
   }
+
+  // Compute probFromFnEntry for each edge by walking the enclosing-edge chain.
+  // Branches are in depth-first order so enclosing edges are already processed.
+  const probFromFnEntryByEdge = new Map<string, number>()
+  for (const branchResult of branchResults) {
+    const enclosingEdgeId = branchResult.baseline.parentEdgeId
+    const enclosingProb = enclosingEdgeId
+      ? probFromFnEntryByEdge.get(enclosingEdgeId) ?? 1
+      : 1
+    for (const edge of branchResult.edges) {
+      const probFromFnEntry = edge.entryProbability * enclosingProb
+      assertInRange(probFromFnEntry, "edge.probFromFnEntry")
+      edge.probFromFnEntry = probFromFnEntry
+      probFromFnEntryByEdge.set(edge.edgeId, probFromFnEntry)
+    }
+  }
+
   const diagnostics = ts.getPreEmitDiagnostics(program, sourceFile).map(diagnostic =>
     formatDiagnostic(diagnostic, originalSource, edits)
   )
@@ -1078,7 +1109,7 @@ function planBranches(
     return probe.metadata
   }
 
-  function visit(node: ts.Node, depth: number): void {
+  function visit(node: ts.Node, depth: number, enclosingEdgeId?: string): void {
     if (node !== target && ts.isFunctionLike(node)) {
       return
     }
@@ -1091,25 +1122,31 @@ function planBranches(
         })
       } else {
         const position = locationOf(sourceFile, node)
+        const baseline = planBaseline(node, depth)
+        const trueProbe = planExistingEdge(node.thenStatement, depth, 1, "true")
+        const falseProbe = node.elseStatement
+          ? planExistingEdge(node.elseStatement, depth, 2, "false")
+          : planMissingElse(node, depth)
         const planned: PlannedBranch = {
           ...position,
           condition: node.expression.getText(sourceFile),
-          baseline: planBaseline(node, depth),
-          edges: [{
-            edge: "true",
-            probe: planExistingEdge(node.thenStatement, depth, 1, "true"),
-          }, {
-            edge: "false",
-            probe: node.elseStatement
-              ? planExistingEdge(node.elseStatement, depth, 2, "false")
-              : planMissingElse(node, depth),
-          }],
+          baseline,
+          parentEdgeId: enclosingEdgeId ?? null,
+          edges: [
+            {edge: "true", probe: trueProbe},
+            {edge: "false", probe: falseProbe},
+          ],
         }
         branches.push(planned)
+        visit(node.thenStatement, depth + 1, trueProbe.edgeId)
+        if (node.elseStatement) {
+          visit(node.elseStatement, depth + 1, falseProbe.edgeId)
+        }
       }
+      return
     }
 
-    ts.forEachChild(node, child => visit(child, depth + 1))
+    ts.forEachChild(node, child => visit(child, depth + 1, enclosingEdgeId))
   }
 
   visit(target.body!, 0)
@@ -1234,6 +1271,29 @@ function readProbeTypes(
   return {probes, invalidProbeIds}
 }
 
+function computeEntryProbability(baseline: ts.Type, edge: ts.Type): number {
+  if ((baseline.flags & ts.TypeFlags.Never) !== 0) return 1
+  if ((edge.flags & ts.TypeFlags.Never) !== 0) return 0
+  const baselineSize = typeConstituentCount(baseline)
+  const edgeSize = typeConstituentCount(edge)
+  const probability = Math.min(1, edgeSize / baselineSize)
+  assertInRange(probability, "computeEntryProbability")
+  return probability
+}
+
+function assertInRange(value: number, label: string): void {
+  if (value < 0 || value > 1) {
+    throw new Error(`${label}: expected ${value} to be in [0, 1]`)
+  }
+}
+
+function typeConstituentCount(type: ts.Type): number {
+  if ((type.flags & ts.TypeFlags.Union) !== 0) {
+    return (type as ts.UnionType).types.length
+  }
+  return 1
+}
+
 function classifyBranch(
   branch: PlannedBranch,
   probes: Map<string, ProbeTypes>,
@@ -1256,6 +1316,7 @@ function classifyBranch(
         baselineType: baseline.strings.get(name)!,
         edgeType: edgeTypes.strings.get(name)!,
         classification,
+        entryProbability: computeEntryProbability(baselineType, edgeType),
       }
     })
     const classification: ParameterClassification = parameters.some(
@@ -1265,12 +1326,16 @@ function classifyBranch(
       : parameters.some(parameter => parameter.classification === "inherited-unreachable")
         ? "inherited-unreachable"
         : "reachable"
+    const entryProbability = Math.min(...parameters.map(p => p.entryProbability))
+    assertInRange(entryProbability, "edge.entryProbability")
     return {
       edgeId: probe.edgeId,
       edge,
       location: probe.location,
       parentEdgeId: branch.baseline.edgeId,
       classification,
+      entryProbability,
+      probFromFnEntry: entryProbability,
       parameters,
     }
   })
@@ -1287,7 +1352,7 @@ function classifyBranch(
         name,
         type: baseline.strings.get(name)!,
       })),
-      parentEdgeId: null,
+      parentEdgeId: branch.parentEdgeId,
     },
     edges,
   }

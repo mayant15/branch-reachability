@@ -88,6 +88,56 @@ Classify the edge as newly unreachable if any parameter newly becomes `never`. P
 
 Do not require every edge type to be assignable to its baseline type. A condition can assign to a parameter, so control-flow types are not guaranteed to narrow monotonically.
 
+## Branch Entry Probability Metric
+
+Every parameter of every edge receives an **entry probability** — a number in `[0, 1]` that quantifies how much of the baseline type space remains after the condition narrows it. This is a structural, type-system-based heuristic, not a runtime statistical probability.
+
+### Per-parameter computation
+
+```
+P(param) =
+  1.0    if baselineType is `never`         (condition is not the cause of unreachability)
+  0.0    if edgeType is `never`             (condition makes this parameter type impossible)
+  1.0    if baselineType and edgeType are   (condition does not constrain this parameter)
+         the same union of constituents
+  min(1.0, edgeConstituents / baselineConstituents)   otherwise
+```
+
+Where `typeConstituentCount(type)` is:
+- the number of members of a union type (`type.types.length`) when `type.flags & TypeFlags.Union` is set;
+- `1` for all other types (primitives, intersections, literals, etc.).
+
+### Edge-level aggregation
+
+The edge entry probability is the **minimum** of all per-parameter entry probabilities for that edge. This matches the existing edge-classification rule: if one parameter becomes `never`, the entire edge is unreachable. Taking the minimum makes the edge-level probability 0 whenever any parameter becomes impossible.
+
+### Rationale and limitations
+
+- The metric is a **coarse upper bound on specificity**, not a true probability. A narrowing from `string` to `"hello"` scores 1 because both are atomic (non-union) types, even though the condition is highly specific.
+- A narrowing from a union type with N members to a subset with M members scores M/N. For example, `{kind: "circle", radius: number} | {kind: "square", side: number}` narrowing to the circle variant scores 0.5.
+- `boolean` is internally represented as `true | false` (a 2-member union), so `if (x)` with `T = boolean` scores 0.5 for both edges.
+- An inherited-unreachable edge (baseline already `never`) scores 1 because the condition being analyzed is not what made the edge inaccessible.
+- Intersection types are treated as single constituents, which may overestimate specificity when narrowing a large intersection.
+- The metric operates on TypeScript's view of types after counterfactual parameter overrides, not on runtime value distributions.
+
+### Cumulative path probability
+
+Every baseline has a `parentEdgeId` that links it to its enclosing edge (the true or false edge of the parent branch that contains it). Root-level baselines directly in the function body have `parentEdgeId: null`. This forms a tree from function entry to every edge.
+
+Every edge has a **`probFromFnEntry`** field — the cumulative product of `entryProbability` values along the chain from function entry. For a root-level edge this equals its `entryProbability`. For a nested edge inside an enclosing edge `E`, the value is:
+
+```
+edge.probFromFnEntry = edge.entryProbability × E.probFromFnEntry
+```
+
+The computation is performed during analysis by walking the parent chain in depth-first order (enclosing edges are always processed before their nested children). The result is stored directly on each `EdgeResult` and persisted as `prob_from_fn_entry` in the SQLite `edges` table.
+
+This product is a structural heuristic: it assumes the narrowing at each branch is independent, which is not true in general but provides a useful upper bound. For example, a nested edge at depth 2 with `entryProbability` values 0.5 and 0.3 has `probFromFnEntry = 0.15`.
+
+### Schema and output
+
+The entry probability appears as `entryProbability` in structured `EdgeResult` and `ParameterResult` objects, as `entry_probability` in `AnalysisTableRow`, and as a `REAL` column in the SQLite `edges` table. Baseline rows store 1.
+
 The initial analysis deliberately excludes general control-flow unreachability caused by `return`, `throw`, or constant conditions. The compiler represents some such paths with an internal unreachable flow value that `getTypeAtLocation` may expose as the declared type. Detecting those paths would require a separate, explicitly designed analysis rather than interpreting all non-`never` probe results as proof of reachability.
 
 ## Proposed Components
