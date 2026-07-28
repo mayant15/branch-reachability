@@ -17,7 +17,7 @@ NODE_V8_COVERAGE → coverage import) for every configured library in two modes:
 declaration-based types and --type any. Produces one SQLite database per run.
 
 Options:
-  --iterations <n>    Fuzzer iterations per run (default: 100000)
+  --iterations <n>    Fuzzer iterations per run (default: 1_000_000)
   --help              Show this help`
 
 interface LibraryConfig {
@@ -49,7 +49,7 @@ function parseCliArgs(): {iterations: number} {
   }
 
   return {
-    iterations: parsed.values.iterations ? Number(parsed.values.iterations) : 100000,
+    iterations: parsed.values.iterations ? Number(parsed.values.iterations) : 1_000_000,
   }
 }
 
