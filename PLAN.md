@@ -12,7 +12,7 @@ This is an analysis of TypeScript's model, not proof that code is unreachable at
 
 ## Current Status
 
-**Phases 1 through 6 are complete.** The project now has a single-function engine, runtime-discovered library analysis, and an earlier narrow call-discovery experiment. Work moves next to explicit call-graph expansion.
+**Phases 1 through 6 and the input-type extension are complete.** The project now has a single-function engine, runtime-discovered library analysis, declaration-backed parameter types, and an earlier narrow call-discovery experiment. Work moves next to explicit call-graph expansion.
 
 ### Implemented baseline
 
@@ -27,13 +27,13 @@ The implementation lives in `index.ts` and exposes:
 
 `library.ts` executes a trusted CommonJS entry in a child process, discovers package-owned files through `require.cache`, inventories direct top-level named function declarations, and independently analyzes each function with failure isolation.
 
-The `cli.ts` entry point is available through `npm run analyze`. File mode supports configurable `T`, human-readable or JSON output, explicit `--project`, and `--no-project`. Package mode accepts `--package`, `--export`, `--max-depth`, and `--max-functions`. Both modes accept `--sql <path>` to transactionally upsert edge rows into SQLite.
+The `cli.ts` entry point is available through `npm run analyze`. File mode supports configurable `T` via `--type`, declaration-backed parameter types via `--decl <path>`, human-readable or JSON output, explicit `--project`, and `--no-project`. Package mode accepts `--package`, `--export`, `--max-depth`, and `--max-functions`. Library mode accepts `--library` and `--library-root`. All modes accept `--sql <path>` to transactionally upsert edge rows into SQLite, except declaration and library modes which reject `--sql` until per-parameter context persistence exists.
 
 The `coverage.ts` entry point is available through `npm run coverage`. It imports raw V8 coverage reports into an edge database, matching only true/false edges by exact or smallest-containing original-source spans and summing unambiguous counts across reports.
 
-The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden. A function is rejected as a whole if any parameter cannot be overridden safely.
+The analyzer currently overrides all supported parameters with configurable `T` (`string` by default), or applies declaration-backed parameter types from a supplied `.d.ts` file while preserving source-defined types for unmatched private functions. It builds a fresh virtual `Program`, and analyzes `if` statements in statement lists and single-statement positions. It handles TypeScript and JavaScript—including `.js`, `.jsx`, `.cjs`, and `.mjs`—while preserving each source language. It supports block-bodied and unbraced edges, synthesizes missing false edges, and reports each `else if` as a distinct branch. Existing TypeScript annotations and JavaScript JSDoc types are overridden when a parameter receives an explicit type; unmatched private functions retain their original annotations. A function is rejected as a whole if any parameter cannot be overridden safely.
 
-Fifty-one tests in `index.test.ts` cover Phases 1 through 6, declaration-backed and source-preserved parameter contexts, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
+Sixty-two tests in `index.test.ts` cover Phases 1 through 6, declaration-backed and source-preserved parameter contexts, tabular edge output, SQLite persistence, synthetic V8 range matching, and the five saved `js-yaml` coverage reports. `npm test`, strict TypeScript checking, CLI execution, and `git diff --check` pass.
 
 The `tests/` directory contains manually runnable end-to-end CLI fixtures for basic and nested narrowing, multiple parameters, discriminated unions, counterfactual and generated diagnostics, and unsupported function/branch syntax. Copy-paste commands and expected behavior are documented in `tests/README.md`.
 
@@ -50,6 +50,7 @@ The `tests/` directory contains manually runnable end-to-end CLI fixtures for ba
 ### Roadmap at a glance
 
 1. **Phase 6 — Library-level analysis (complete):** execute a CommonJS entry file to discover its package-owned file closure, enumerate every direct top-level named function declaration, and analyze each independently in one job.
+2. **Input-type extension — Parameterized function analysis (complete):** the core analysis consumes a function identity plus an ordered parameter-type vector. `--type` produces a uniform vector, `--decl <path>` produces the exact per-function vector TypeScript sees, and no flag retains the `string` fallback.
 2. **Input-type extension — Parameterized function analysis (complete):** the core analysis consumes a function identity plus an ordered parameter-type vector. `--type` produces a uniform vector, `--decl <path>` produces the exact per-function vector TypeScript sees, and no flag retains the `string` fallback.
 3. **Phase 7 — Call-graph expansion:** promote discovery to explicit function and callsite records, broaden static callee resolution in measured steps, and retain unresolved or ambiguous edges rather than guessing.
 4. **Later contextual analysis:** only after the graph is reliable, evaluate caller-to-callee type specialization, aliases, and object-property provenance as separate experiments.
@@ -658,27 +659,27 @@ Current TypeScript-defined js-yaml result:
 
 ##### 11. Verify the completed extension
 
-- [ ] Run focused declaration, private-type, CLI, package, and library tests during implementation.
-- [ ] Run the complete `npm test` suite.
-- [ ] Run strict TypeScript checking using the repository's established command.
-- [ ] Run representative human and JSON CLI commands in both modes.
-- [ ] Run `git diff --check` and confirm analyzed source/declaration fixtures remain unchanged.
+- [x] Run focused declaration, private-type, CLI, package, and library tests during implementation.
+- [x] Run the complete `npm test` suite.
+- [x] Run strict TypeScript checking using the repository's established command.
+- [x] Run representative human and JSON CLI commands in both modes.
+- [x] Run `git diff --check` and confirm analyzed source/declaration fixtures remain unchanged.
 
 #### Acceptance criteria
 
-- [ ] Omitting both `--type` and `--decl` still analyzes every supported parameter as `string`.
-- [ ] Supplying both flags fails before source analysis with a clear mutual-exclusion error.
+- [x] Omitting both `--type` and `--decl` still analyzes every supported parameter as `string`.
+- [x] Supplying both flags fails before source analysis with a clear mutual-exclusion error.
 - [x] `--decl` rejects missing, unreadable, non-`.d.ts`, and invalid files; compatible overloads are unioned positionally, while arity-mismatched and rest-parameter matches fail without falling back to `string`.
-- [ ] A declaration with different parameter types applies the correct type to each implementation parameter by position.
-- [ ] Optional declaration parameters retain `undefined` in their configured type.
-- [ ] Parameter types that reference declaration-local aliases, interfaces, classes, or imported declarations resolve in the instrumented program rather than degrading to unresolved `any`.
-- [ ] Declaration-backed TypeScript and JavaScript inputs produce the expected true/false `never` classifications and leave both source files unchanged.
-- [ ] Uniform and TypeScript-defined modes analyze exactly the same complete fixture-library function inventory.
-- [ ] Unmatched private functions preserve implementation annotations, JSDoc, or inferred types; genuinely untyped parameters remain `any` and are labeled `inferred-any`.
-- [ ] In library mode, incompatible matched declarations are isolated failures and unrelated functions still produce analyses.
-- [ ] Analysis results identify the function-plus-parameter-vector context, allowing one function to have multiple distinct contexts without ID collisions.
-- [ ] Human and JSON output identify each parameter's declaration-backed, source-annotated, inferred, or inferred-any origin; uniform output remains backward compatible.
-- [ ] Existing explicit `--type`, default-string, diagnostics, package traversal, and library discovery tests continue to pass.
+- [x] A declaration with different parameter types applies the correct type to each implementation parameter by position.
+- [x] Optional declaration parameters retain `undefined` in their configured type.
+- [x] Parameter types that reference declaration-local aliases, interfaces, classes, or imported declarations resolve in the instrumented program rather than degrading to unresolved `any`.
+- [x] Declaration-backed TypeScript and JavaScript inputs produce the expected true/false `never` classifications and leave both source files unchanged.
+- [x] Uniform and TypeScript-defined modes analyze exactly the same complete fixture-library function inventory.
+- [x] Unmatched private functions preserve implementation annotations, JSDoc, or inferred types; genuinely untyped parameters remain `any` and are labeled `inferred-any`.
+- [x] In library mode, incompatible matched declarations are isolated failures and unrelated functions still produce analyses.
+- [x] Analysis results identify the function-plus-parameter-vector context, allowing one function to have multiple distinct contexts without ID collisions.
+- [x] Human and JSON output identify each parameter's declaration-backed, source-annotated, inferred, or inferred-any origin; uniform output remains backward compatible.
+- [x] Existing explicit `--type`, default-string, diagnostics, package traversal, and library discovery tests continue to pass.
 
 #### Non-goals for this extension
 
@@ -761,7 +762,7 @@ Every regression test should assert structured classifications and original sour
 
 Current coverage is split between:
 
-- `index.test.ts`: 51 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, declaration-context, library discovery/inventory, `console.table` formatting, SQLite persistence, V8 coverage import, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
+- `index.test.ts`: 62 automated API, compiler-host, TypeScript/JavaScript branch-rewrite, declaration-context, library discovery/inventory, `console.table` formatting, SQLite persistence, V8 coverage import, location-ID/parent linkage, configuration, CLI, CommonJS discovery, traversal-guard, and `js-yaml` integration tests;
 - `coverage/v8/js-yaml`: five committed raw V8 reports exercised by the coverage-import regression test;
 - `tests/basic.ts`, `multiple-parameters.ts`, `nested.ts`, and `discriminated-union.ts`: successful CLI analysis examples;
 - `tests/diagnostics.ts`: diagnostics produced by the counterfactual parameter type;
